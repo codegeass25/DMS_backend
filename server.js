@@ -95,6 +95,7 @@ const GUARDS = [
     { method: 'PUT',  path: '/api/whitelabel',   mod: 'whiteLabel',    action: 'write' },
     { method: 'POST', path: '/api/test-email',   mod: 'emailConfig',   action: 'write' },
     { method: 'POST', path: '/api/reload-config',mod: 'emailConfig',   action: 'write' },
+    { method: 'GET',  path: '/api/brevo/diagnostics', mod: 'emailConfig', action: 'read' },
     { method: 'GET',  path: '/api/users',        mod: 'userManagement',action: 'read'  },
     { method: 'PUT',  path: '/api/users',        mod: 'userManagement',action: 'write' }
 ];
@@ -481,8 +482,14 @@ function normalizeStructure(data) {
     v.emailLogs = Array.isArray(v.emailLogs) ? v.emailLogs : [];
 
     v.emailConfig = (v.emailConfig && typeof v.emailConfig === 'object') ? v.emailConfig : {
-        enabled: true, server: 'smtp.gmail.com', port: 465, email: '', pass: '', name: ''
+        enabled: true, provider: 'brevo-api', server: 'smtp-relay.brevo.com', port: 587,
+        smtpLogin: '', email: '', pass: '', name: ''
     };
+    // Migrate legacy Gmail-shaped records onto the Brevo-first shape.
+    if (!v.emailConfig.provider) {
+        v.emailConfig.provider = /brevo/i.test(v.emailConfig.server || '') ? 'brevo-smtp' : 'brevo-api';
+    }
+    if (typeof v.emailConfig.smtpLogin !== 'string') v.emailConfig.smtpLogin = '';
 
     v.settings = { ...DEFAULT_SETTINGS, ...(v.settings || {}) };
     // ---- White Label: ensure object exists and mirror to legacy fields ----
@@ -663,7 +670,7 @@ function appendEmailLog(entry) {
             date: new Date().toLocaleString(),
             timestamp: new Date().toISOString(),
             to: '', subject: '', type: '', status: 'Pending',
-            retries: 0, error: '',
+            retries: 0, error: '', provider: '', messageId: '', delivery: '',
             reference: '',
             ...entry
         });
@@ -736,54 +743,259 @@ function injectReference(html, reference) {
 }
 
 /* ====================================================================
- * EMAIL PIPELINE — validation, retry, dispatch
+ * EMAIL PIPELINE — Brevo-first (API), SMTP relay fallback
+ *
+ * WHY THIS WAS REWRITTEN
+ * ----------------------
+ * The previous pipeline authenticated to SMTP with the *sender address*
+ * (auth.user = cfg.email) and treated "no exception from sendMail()" as
+ * proof of delivery. With Brevo on port 2525 that combination produces the
+ * exact bug reported: the handshake succeeds, nodemailer resolves, the UI
+ * toasts "sent" — and the message is silently dropped by Brevo because
+ *   (a) the SMTP login is NOT the sender address (it is 9xxxxx@smtp-brevo.com),
+ *   (b) the From address was never validated as a Brevo sender, and
+ *   (c) nobody ever checked the provider's own accept/delivery verdict.
+ *
+ * The pipeline below fixes all three:
+ *   1. Default transport is the Brevo HTTP API (through the Lovable
+ *      connector gateway, or direct with a Brevo key) — no outbound SMTP
+ *      ports, which Render's free plan throttles/blocks anyway.
+ *   2. SMTP mode keeps a SEPARATE smtpLogin field so auth != sender.
+ *   3. Every send records the provider messageId and, for the Brevo API,
+ *      the real delivery event is polled back from Brevo. A message that is
+ *      blocked/bounced/spam is logged as Failed — the UI can no longer toast
+ *      a success the provider never honoured.
  * ==================================================================== */
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-function validateSmtpConfig(cfg) {
-    if (!cfg) return 'SMTP config missing.';
-    if (!cfg.enabled) return 'SMTP integration is disabled.';
+const BREVO_GATEWAY_URL   = (process.env.BREVO_GATEWAY_URL || 'https://connector-gateway.lovable.dev/brevo').replace(/\/+$/, '');
+const BREVO_DIRECT_API_URL = (process.env.BREVO_DIRECT_API_URL || 'https://api.brevo.com/v3').replace(/\/+$/, '');
+
+/** Which Brevo transport the environment can actually serve right now. */
+function brevoMode() {
+    if (process.env.LOVABLE_API_KEY && process.env.BREVO_API_KEY) return 'gateway';
+    if (process.env.BREVO_DIRECT_API_KEY) return 'direct';
+    return 'none';
+}
+
+/** Single entry point for every Brevo REST call (gateway or direct). */
+async function brevoFetch(path, { method = 'GET', body = null, query = null } = {}) {
+    const mode = brevoMode();
+    if (mode === 'none') {
+        const err = new Error('Brevo is not configured. Set LOVABLE_API_KEY + BREVO_API_KEY (connector gateway) or BREVO_DIRECT_API_KEY.');
+        err.permanent = true;
+        throw err;
+    }
+    const base = mode === 'gateway' ? BREVO_GATEWAY_URL : BREVO_DIRECT_API_URL;
+    let url = `${base}/${String(path).replace(/^\/+/, '')}`;
+    if (query && Object.keys(query).length) {
+        const qs = new URLSearchParams(Object.entries(query).filter(([, v]) => v !== undefined && v !== null && v !== ''));
+        if (qs.toString()) url += `?${qs.toString()}`;
+    }
+    const headers = { 'Content-Type': 'application/json', Accept: 'application/json' };
+    if (mode === 'gateway') {
+        headers['Authorization'] = `Bearer ${process.env.LOVABLE_API_KEY}`;
+        headers['X-Connection-Api-Key'] = process.env.BREVO_API_KEY;
+    } else {
+        headers['api-key'] = process.env.BREVO_DIRECT_API_KEY;
+    }
+
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 20000);
+    let response;
+    try {
+        response = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined, signal: ctrl.signal });
+    } finally { clearTimeout(timer); }
+
+    const raw = await response.text();
+    let parsed = null;
+    try { parsed = raw ? JSON.parse(raw) : null; } catch (_) { parsed = null; }
+
+    if (!response.ok) {
+        const detail = (parsed && (parsed.message || parsed.error || parsed.code)) || raw || `HTTP ${response.status}`;
+        const err = new Error(`Brevo ${mode} request failed [${response.status}]: ${detail}`);
+        err.status = response.status;
+        err.body = parsed || raw;
+        // 4xx other than 429 will never succeed on retry — fail fast and loudly.
+        err.permanent = response.status >= 400 && response.status < 500 && response.status !== 429;
+        throw err;
+    }
+    return parsed !== null ? parsed : raw;
+}
+
+/* -------------------- Configuration validation -------------------- */
+
+function emailProviderOf(cfg) {
+    const p = (cfg && cfg.provider) || 'brevo-api';
+    return ['brevo-api', 'brevo-smtp', 'smtp'].includes(p) ? p : 'brevo-api';
+}
+
+function validateEmailConfig(cfg) {
+    if (!cfg) return 'Email config missing.';
+    if (!cfg.enabled) return 'Email integration is disabled.';
     if (!cfg.email || !EMAIL_REGEX.test(cfg.email)) return 'Sender email is missing or invalid.';
-    if (!cfg.pass) return 'SMTP password / app password is missing.';
+
+    if (emailProviderOf(cfg) === 'brevo-api') {
+        if (brevoMode() === 'none') {
+            return 'Brevo API keys are not present on the server. Add LOVABLE_API_KEY + BREVO_API_KEY (or BREVO_DIRECT_API_KEY) to the environment.';
+        }
+        return null;
+    }
+    // SMTP relay modes
     if (!cfg.server) return 'SMTP server host is missing.';
-    if (!cfg.port || isNaN(parseInt(cfg.port))) return 'SMTP port is invalid.';
+    if (!cfg.port || isNaN(parseInt(cfg.port, 10))) return 'SMTP port is invalid.';
+    if (!smtpLoginOf(cfg)) return 'SMTP login is missing (Brevo shows it as 9xxxxx@smtp-brevo.com — it is NOT your sender address).';
+    if (!cfg.pass) return 'SMTP key / password is missing.';
     return null;
+}
+// Legacy alias — older call sites still reference this name.
+const validateSmtpConfig = validateEmailConfig;
+
+/** The SMTP username. Falls back to the sender address only for classic SMTP. */
+function smtpLoginOf(cfg) {
+    const explicit = (cfg.smtpLogin || cfg.login || '').trim();
+    if (explicit) return explicit;
+    return emailProviderOf(cfg) === 'smtp' ? (cfg.email || '') : '';
 }
 
 function buildTransport(cfg) {
-    const port = parseInt(cfg.port) || 465;
+    const port = parseInt(cfg.port, 10) || 587;
+    const secure = port === 465;
     return nodemailer.createTransport({
-        host: cfg.server || 'smtp.gmail.com',
+        host: cfg.server || 'smtp-relay.brevo.com',
         port,
-        secure: port === 465,
-        auth: { user: cfg.email, pass: cfg.pass },
-        tls: { rejectUnauthorized: false },
-        // Hosts like Render can silently drop outbound SMTP; without these the
-        // socket hangs forever and the Test Email button never gets a response.
+        secure,
+        // 587 / 2525 are STARTTLS ports: without requireTLS some relays keep the
+        // session in plaintext and quietly discard the message after DATA.
+        requireTLS: !secure,
+        auth: { user: smtpLoginOf(cfg), pass: cfg.pass },
+        tls: { rejectUnauthorized: false, servername: cfg.server || undefined },
         connectionTimeout: 15000,
         greetingTimeout: 15000,
         socketTimeout: 20000
     });
 }
 
-
-async function verifySmtpHandshake(cfg) {
-    const invalid = validateSmtpConfig(cfg);
+/** Provider-aware pre-flight check used by /api/test-email. */
+async function verifyEmailTransport(cfg) {
+    const invalid = validateEmailConfig(cfg);
     if (invalid) return { ok: false, reason: invalid };
+
+    if (emailProviderOf(cfg) === 'brevo-api') {
+        try {
+            const account = await brevoFetch('account');
+            const senders = await listBrevoSenders();
+            const match = senders.find(s => String(s.email || '').toLowerCase() === String(cfg.email).toLowerCase());
+            if (senders.length && !match) {
+                return {
+                    ok: false,
+                    reason: `"${cfg.email}" is not a verified Brevo sender. Brevo accepts the API call but never delivers mail from an unverified address — add and confirm it under Brevo → Senders, Domains & Dedicated IPs.`
+                };
+            }
+            if (match && match.active === false) {
+                return { ok: false, reason: `Brevo sender "${cfg.email}" exists but is not yet confirmed. Click the verification link Brevo emailed you.` };
+            }
+            return { ok: true, mode: brevoMode(), account: account && account.email ? account.email : undefined };
+        } catch (e) {
+            return { ok: false, reason: e.message };
+        }
+    }
+
     try {
-        const t = buildTransport(cfg);
-        await t.verify();
-        return { ok: true };
+        await buildTransport(cfg).verify();
+        return { ok: true, mode: 'smtp' };
     } catch (e) { return { ok: false, reason: 'SMTP verify failed: ' + e.message }; }
+}
+// Legacy alias.
+const verifySmtpHandshake = verifyEmailTransport;
+
+async function listBrevoSenders() {
+    try {
+        const out = await brevoFetch('senders');
+        return Array.isArray(out && out.senders) ? out.senders : [];
+    } catch (_) { return []; }
+}
+
+/**
+ * Ask Brevo what actually happened to a message. Returns the newest event
+ * name (delivered / requests / softBounce / hardBounce / blocked / spam /
+ * invalid / deferred) or '' when Brevo has nothing yet.
+ */
+async function fetchBrevoDeliveryEvent(messageId, { attempts = 4, waitMs = 2000 } = {}) {
+    if (!messageId) return '';
+    for (let i = 0; i < attempts; i++) {
+        try {
+            const out = await brevoFetch('smtp/statistics/events', { query: { messageId, limit: 20 } });
+            const events = (out && Array.isArray(out.events)) ? out.events : [];
+            if (events.length) {
+                const priority = ['hardBounce', 'softBounce', 'blocked', 'spam', 'invalid', 'error', 'deferred', 'delivered', 'requests'];
+                events.sort((a, b) => priority.indexOf(a.event) - priority.indexOf(b.event));
+                return events[0].event || '';
+            }
+        } catch (_) { /* statistics may lag or be unavailable on free plans */ }
+        if (i < attempts - 1) await new Promise(r => setTimeout(r, waitMs));
+    }
+    return '';
+}
+
+const BREVO_FAILURE_EVENTS = ['hardBounce', 'softBounce', 'blocked', 'spam', 'invalid', 'error'];
+
+/* -------------------- Dispatch -------------------- */
+
+function senderNameFor(settings) {
+    const wl = ((settings || {}).whiteLabel && Object.keys((settings || {}).whiteLabel).length)
+        ? resolveWhiteLabel((settings || {}).whiteLabel)
+        : BrandingService.read();
+    return (wl.emailSenderName || '').trim() || 'System Admin';
+}
+
+/** Brevo HTTP API send. Resolves { messageId } or throws. */
+async function sendViaBrevoApi({ to, subject, html, text, cfg, senderName, replyTo }) {
+    const payload = {
+        sender: { name: senderName, email: cfg.email },
+        to: [{ email: to }],
+        subject,
+        htmlContent: html || undefined,
+        textContent: text || undefined
+    };
+    if (replyTo && EMAIL_REGEX.test(replyTo)) payload.replyTo = { email: replyTo };
+    const out = await brevoFetch('smtp/email', { method: 'POST', body: payload });
+    const messageId = (out && (out.messageId || (Array.isArray(out.messageIds) && out.messageIds[0]))) || '';
+    if (!messageId) {
+        const err = new Error('Brevo accepted the request but returned no messageId — the send cannot be confirmed.');
+        err.permanent = false;
+        throw err;
+    }
+    return { messageId: String(messageId) };
+}
+
+/** SMTP send that refuses to call itself a success unless the relay accepted. */
+async function sendViaSmtp({ to, subject, html, text, cfg, senderName, replyTo }) {
+    const transport = buildTransport(cfg);
+    const info = await transport.sendMail({
+        from: `"${senderName}" <${cfg.email}>`,
+        to, subject,
+        html: html || undefined,
+        text: text || (html ? html.replace(/<[^>]+>/g, ' ') : ''),
+        replyTo: replyTo || undefined
+    });
+    const accepted = Array.isArray(info.accepted) ? info.accepted : [];
+    const rejected = Array.isArray(info.rejected) ? info.rejected : [];
+    if (!accepted.length || rejected.length) {
+        const err = new Error(`Relay did not accept the recipient (${info.response || 'no response'}).`);
+        err.permanent = true;
+        throw err;
+    }
+    return { messageId: info.messageId || '', response: info.response || '' };
 }
 
 /**
  * Dispatch a single email with automatic retry. Records a structured entry
  * in emailLogs regardless of outcome. Never throws — one failure must not
  * halt the surrounding batch. Generates and records a unique Email
- * Reference Number per dispatch.
+ * Reference Number, the provider used, and the provider messageId.
  */
-async function sendEmailWithRetry({ to, subject, html, text, type = 'Reminder', config, settings }) {
+async function sendEmailWithRetry({ to, subject, html, text, type = 'Reminder', config, settings, verifyDelivery = false }) {
     const cfg = config;
     const st = { ...DEFAULT_SETTINGS, ...(settings || {}) };
     const maxAttempts = Math.max(1, (st.retryAttempts || 3) + 1); // +1 = initial try
@@ -791,55 +1003,56 @@ async function sendEmailWithRetry({ to, subject, html, text, type = 'Reminder', 
 
     const reference = generateEmailReference(type);
     const finalHtml = injectReference(html, reference);
+    const provider = emailProviderOf(cfg || {});
 
-    // Validate recipient + config up-front
     if (!to || !EMAIL_REGEX.test(to)) {
-        const entry = { to: to || '', subject, type, status: 'Failed', retries: 0, error: 'Invalid recipient email format.', reference };
+        const entry = { to: to || '', subject, type, status: 'Failed', retries: 0, error: 'Invalid recipient email format.', reference, provider };
         appendEmailLog(entry);
         return { success: false, reason: entry.error, reference };
     }
-    const invalid = validateSmtpConfig(cfg);
+    const invalid = validateEmailConfig(cfg);
     if (invalid) {
-        appendEmailLog({ to, subject, type, status: 'Failed', retries: 0, error: invalid, reference });
+        appendEmailLog({ to, subject, type, status: 'Failed', retries: 0, error: invalid, reference, provider });
         return { success: false, reason: invalid, reference };
     }
 
-    let transport;
-    try { transport = buildTransport(cfg); }
-    catch (e) {
-        appendEmailLog({ to, subject, type, status: 'Failed', retries: 0, error: 'Transport init: ' + e.message, reference });
-        return { success: false, reason: e.message, reference };
-    }
-
-    // FIX: resolve the sender name from the persisted White Label record.
-    // If the caller passed a settings object without a whiteLabel block we fall
-    // back to the stored branding instead of silently auto-deriving "DMS Admin".
-    const _wlForSender = ((settings || {}).whiteLabel && Object.keys((settings || {}).whiteLabel).length)
-        ? resolveWhiteLabel((settings || {}).whiteLabel)
-        : BrandingService.read();
-    const _senderName = (_wlForSender.emailSenderName || '').trim() || 'System Admin';
-
-    const mailOptions = {
-        from: `"${_senderName}" <${cfg.email}>`,
-        to, subject,
-        html: finalHtml || undefined,
-        text: text || (finalHtml ? finalHtml.replace(/<[^>]+>/g, ' ') : ''),
-        replyTo: st.replyTo || undefined
-    };
+    const senderName = senderNameFor(settings);
+    const replyTo = st.replyTo || undefined;
+    const send = provider === 'brevo-api' ? sendViaBrevoApi : sendViaSmtp;
 
     let lastErr = '';
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
-            await transport.sendMail(mailOptions);
-            appendEmailLog({ to, subject, type, status: 'Sent', retries: attempt - 1, error: '', reference });
-            return { success: true, attempts: attempt, reference };
+            const result = await send({ to, subject, html: finalHtml, text, cfg, senderName, replyTo });
+
+            // Confirm with the provider instead of trusting a bare 2xx.
+            let delivery = '';
+            if (provider === 'brevo-api' && verifyDelivery) {
+                delivery = await fetchBrevoDeliveryEvent(result.messageId);
+                if (BREVO_FAILURE_EVENTS.includes(delivery)) {
+                    lastErr = `Brevo reported "${delivery}" for this message — it was accepted but NOT delivered.`;
+                    appendEmailLog({
+                        to, subject, type, status: 'Failed', retries: attempt - 1,
+                        error: lastErr, reference, provider, messageId: result.messageId, delivery
+                    });
+                    return { success: false, reason: lastErr, reference, messageId: result.messageId, delivery };
+                }
+            }
+
+            appendEmailLog({
+                to, subject, type, status: 'Sent', retries: attempt - 1, error: '',
+                reference, provider, messageId: result.messageId || '',
+                delivery: delivery || (provider === 'brevo-api' ? 'accepted' : (result.response || 'accepted'))
+            });
+            return { success: true, attempts: attempt, reference, messageId: result.messageId || '', delivery, provider };
         } catch (err) {
             lastErr = err.message || String(err);
-            console.warn(`[EMAIL] Attempt ${attempt}/${maxAttempts} to ${to} failed: ${lastErr}`);
+            console.warn(`[EMAIL] Attempt ${attempt}/${maxAttempts} to ${to} via ${provider} failed: ${lastErr}`);
+            if (err.permanent) break;             // config/sender errors never heal on retry
             if (attempt < maxAttempts) await new Promise(r => setTimeout(r, waitMs));
         }
     }
-    appendEmailLog({ to, subject, type, status: 'Failed', retries: maxAttempts - 1, error: lastErr, reference });
+    appendEmailLog({ to, subject, type, status: 'Failed', retries: Math.max(0, maxAttempts - 1), error: lastErr, reference, provider });
     return { success: false, reason: lastErr, reference };
 }
 
@@ -2387,7 +2600,7 @@ app.post('/api/send-email', async (req, res) => {
             to, subject, html: html || null, text: body || null,
             type: type || 'Manual', config: cfg, settings: db.settings
         });
-        if (outcome.success) return res.status(200).json({ success: true, message: 'Email dispatched.', reference: outcome.reference });
+        if (outcome.success) return res.status(200).json({ success: true, message: 'Email dispatched.', reference: outcome.reference, messageId: outcome.messageId || '' });
         return res.status(422).json({ error: outcome.reason, reference: outcome.reference });
     } catch (e) { res.status(500).json({ error: 'Send failed.', details: e.message }); }
 });
@@ -2410,7 +2623,7 @@ app.post('/api/send-notification', async (req, res) => {
             type: rendered.type, config: db.emailConfig, settings: db.settings
         });
         return res.status(outcome.success ? 200 : 422).json(outcome.success
-            ? { success: true, reference: outcome.reference, type: rendered.type }
+            ? { success: true, reference: outcome.reference, type: rendered.type, messageId: outcome.messageId || '', provider: outcome.provider || '' }
             : { error: outcome.reason, reference: outcome.reference });
     } catch (e) { res.status(500).json({ error: 'Notification failed.', details: e.message }); }
 });
@@ -2432,30 +2645,93 @@ app.get('/api/notification-types', (req, res) => {
     })));
 });
 
-/** SMTP handshake test — validates connection + sender + delivers a test email. */
+/**
+ * Transport test — validates the provider, the sender identity and then
+ * delivers a real test email whose delivery verdict is read back from Brevo.
+ * A green result now means the provider genuinely accepted AND did not
+ * block/bounce the message.
+ */
 app.post('/api/test-email', async (req, res) => {
     try {
         const cfg = req.body;
         if (!cfg || !cfg.email) return res.status(400).json({ error: 'Invalid config.' });
-        const handshake = await verifySmtpHandshake(cfg);
+        const recipient = (cfg.testRecipient && EMAIL_REGEX.test(cfg.testRecipient)) ? cfg.testRecipient : cfg.email;
+
+        const handshake = await verifyEmailTransport(cfg);
         if (!handshake.ok) return res.status(422).json({ error: handshake.reason });
 
         const db = readStorage();
         const c = ctx(db);
         const reference = REF_PLACEHOLDER;
+        const provider = emailProviderOf(cfg);
         const html = baseShell({
-            title: 'SMTP Test',
-            bodyInner: `<h2 style="color:#047857;margin:0 0 12px 0;">SMTP handshake successful</h2><p>Your automated email pipeline is fully operational.</p>`,
+            title: 'Email Transport Test',
+            bodyInner: `<h2 style="color:#047857;margin:0 0 12px 0;">Transport verified</h2>`
+                     + `<p>This message was delivered through <b>${provider === 'brevo-api' ? 'the Brevo API (' + brevoMode() + ')' : 'the SMTP relay ' + (cfg.server || '') + ':' + (cfg.port || '')}</b>.</p>`
+                     + `<p>Your automated email pipeline is fully operational.</p>`,
             ...c, reference, accent: '#047857'
         });
         const outcome = await sendEmailWithRetry({
-            to: cfg.email, subject: `[${c.dormName}] SMTP Test`,
-            html, type: 'Test', config: cfg, settings: db.settings
+            to: recipient, subject: `[${c.dormName}] Email Transport Test`,
+            html, type: 'Test', config: cfg, settings: db.settings, verifyDelivery: true
         });
-        if (outcome.success) res.status(200).json({ success: true, message: 'Handshake verified — test email delivered.', reference: outcome.reference });
-        else res.status(422).json({ error: outcome.reason, reference: outcome.reference });
-    } catch (e) { res.status(500).json({ error: 'SMTP handshake failed.', details: e.message }); }
+        if (outcome.success) {
+            res.status(200).json({
+                success: true,
+                message: `Delivered via ${provider}${outcome.delivery ? ' — Brevo event: ' + outcome.delivery : ''}.`,
+                reference: outcome.reference, messageId: outcome.messageId || '', delivery: outcome.delivery || '', provider
+            });
+        } else {
+            res.status(422).json({ error: outcome.reason, reference: outcome.reference, provider });
+        }
+    } catch (e) { res.status(500).json({ error: 'Transport test failed.', details: e.message }); }
 });
+
+/**
+ * Brevo diagnostics — the single screen that explains "why did my email not
+ * arrive". Reports which credentials the server can see, the Brevo account,
+ * the verified sender list and whether the configured sender is usable.
+ */
+app.get('/api/brevo/diagnostics', async (req, res) => {
+    const db = readStorage();
+    const cfg = db.emailConfig || {};
+    const out = {
+        provider: emailProviderOf(cfg),
+        brevoMode: brevoMode(),
+        gatewayUrl: BREVO_GATEWAY_URL,
+        env: {
+            LOVABLE_API_KEY: !!process.env.LOVABLE_API_KEY,
+            BREVO_API_KEY: !!process.env.BREVO_API_KEY,
+            BREVO_DIRECT_API_KEY: !!process.env.BREVO_DIRECT_API_KEY
+        },
+        sender: cfg.email || '',
+        senderVerified: null,
+        senders: [],
+        account: null,
+        problems: []
+    };
+    if (out.brevoMode === 'none') {
+        out.problems.push('No Brevo credentials on the server. Add LOVABLE_API_KEY + BREVO_API_KEY (connector gateway) or BREVO_DIRECT_API_KEY in Render → Environment.');
+        return res.status(200).json(out);
+    }
+    try {
+        const account = await brevoFetch('account');
+        out.account = { email: account && account.email, company: account && account.companyName, plan: (account && account.plan) || null };
+    } catch (e) { out.problems.push(e.message); }
+
+    const senders = await listBrevoSenders();
+    out.senders = senders.map(s => ({ email: s.email, name: s.name, active: s.active !== false }));
+    if (out.sender) {
+        const match = out.senders.find(s => String(s.email).toLowerCase() === out.sender.toLowerCase());
+        out.senderVerified = !!(match && match.active);
+        if (!match) out.problems.push(`"${out.sender}" is not registered as a Brevo sender — Brevo will accept the API call and silently drop the mail.`);
+        else if (!match.active) out.problems.push(`Sender "${out.sender}" is registered but not confirmed. Open the confirmation email Brevo sent.`);
+    } else {
+        out.problems.push('No sender address configured in Email Configuration.');
+    }
+    res.status(200).json(out);
+});
+
 
 /** Manual trigger for the auto-billing engine. */
 app.post('/api/run-billing-reminders', async (req, res) => {
