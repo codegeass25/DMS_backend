@@ -649,18 +649,36 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
                     <div class="flex justify-between items-center mb-6"><div><h2 class="text-2xl font-bold text-gray-800">System Settings</h2></div></div>
                     <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
                         <div class="bg-white rounded-xl shadow-sm border p-6" data-perm="emailConfig">
-                            <h3 class="font-bold text-gray-800 mb-4 border-b pb-2"><i class="fa-solid fa-envelope mr-2"></i>Email Configuration (SMTP)</h3>
+                            <h3 class="font-bold text-gray-800 mb-4 border-b pb-2"><i class="fa-solid fa-envelope mr-2"></i>Email Configuration (Brevo)</h3>
                             <form onsubmit="saveEmailSettings(event)" class="space-y-4">
-                                <div class="flex items-center gap-2 mb-4"><input type="checkbox" id="smtp-enabled" class="w-4 h-4 text-blue-600 rounded"><label class="font-bold text-sm">Enable Automated Email Notifications</label></div>
-                                <div class="grid grid-cols-2 gap-4">
-                                    <div><label class="block text-sm font-bold text-gray-700 mb-1">SMTP Server</label><input type="text" id="smtp-server" class="w-full border rounded-lg p-2 text-sm bg-gray-50"></div>
-                                    <div><label class="block text-sm font-bold text-gray-700 mb-1">SMTP Port</label><input type="number" id="smtp-port" class="w-full border rounded-lg p-2 text-sm bg-gray-50"></div>
+                                <div class="flex items-center gap-2 mb-2"><input type="checkbox" id="smtp-enabled" class="w-4 h-4 text-blue-600 rounded"><label class="font-bold text-sm">Enable Automated Email Notifications</label></div>
+                                <div>
+                                    <label class="block text-sm font-bold text-gray-700 mb-1">Delivery Method</label>
+                                    <select id="email-provider" onchange="onEmailProviderChange()" class="w-full border rounded-lg p-2 text-sm bg-gray-50">
+                                        <option value="brevo-api">Brevo API — recommended (no SMTP ports)</option>
+                                        <option value="brevo-smtp">Brevo SMTP relay (587 / 2525)</option>
+                                        <option value="smtp">Custom SMTP server</option>
+                                    </select>
                                 </div>
-                                <div><label class="block text-sm font-bold text-gray-700 mb-1">Sender Gmail Address</label><input type="email" id="smtp-gmail" class="w-full border rounded-lg p-2 text-sm bg-gray-50"></div>
-                                <div><label class="block text-sm font-bold text-gray-700 mb-1">App Password</label><input type="password" id="smtp-pass" class="w-full border rounded-lg p-2 text-sm bg-gray-50"></div>
+                                <div id="brevo-api-note" class="p-3 rounded-lg border bg-blue-50 text-xs text-blue-900 space-y-1">
+                                    <div><i class="fa-solid fa-key mr-1"></i>Brevo keys are read from the <b>server environment</b> (<code>LOVABLE_API_KEY</code> + <code>BREVO_API_KEY</code>, or <code>BREVO_DIRECT_API_KEY</code>). They are never typed or stored in this screen.</div>
+                                    <div><i class="fa-solid fa-circle-info mr-1"></i>The sender address below <b>must be a verified Brevo sender</b>, otherwise Brevo accepts the request and silently drops the mail.</div>
+                                </div>
+                                <div id="smtp-fields" class="space-y-4 hidden">
+                                    <div class="grid grid-cols-2 gap-4">
+                                        <div><label class="block text-sm font-bold text-gray-700 mb-1">SMTP Server</label><input type="text" id="smtp-server" placeholder="smtp-relay.brevo.com" class="w-full border rounded-lg p-2 text-sm bg-gray-50"></div>
+                                        <div><label class="block text-sm font-bold text-gray-700 mb-1">SMTP Port</label><input type="number" id="smtp-port" placeholder="587" class="w-full border rounded-lg p-2 text-sm bg-gray-50"></div>
+                                    </div>
+                                    <div><label class="block text-sm font-bold text-gray-700 mb-1">SMTP Login <span class="font-normal text-gray-500">(Brevo shows this as 9xxxxx@smtp-brevo.com — NOT your sender address)</span></label><input type="text" id="smtp-login" class="w-full border rounded-lg p-2 text-sm bg-gray-50"></div>
+                                    <div><label class="block text-sm font-bold text-gray-700 mb-1">SMTP Key / Password</label><input type="password" id="smtp-pass" class="w-full border rounded-lg p-2 text-sm bg-gray-50"></div>
+                                </div>
+                                <div><label class="block text-sm font-bold text-gray-700 mb-1">Sender Address (verified in Brevo)</label><input type="email" id="smtp-gmail" class="w-full border rounded-lg p-2 text-sm bg-gray-50"></div>
+                                <div><label class="block text-sm font-bold text-gray-700 mb-1">Send Test Email To <span class="font-normal text-gray-500">(optional — defaults to sender)</span></label><input type="email" id="smtp-test-to" class="w-full border rounded-lg p-2 text-sm bg-gray-50"></div>
                                 <div class="p-2 rounded-lg border bg-gray-50 text-xs text-gray-600"><i class="fa-solid fa-lock mr-1"></i><b>Sender Name</b> is inherited from White Label Branding: <span id="smtp-name-inherited" class="font-bold text-gray-800">—</span></div>
-                                <div class="flex justify-end gap-2 pt-2"><button type="button" onclick="testEmail()" class="px-4 py-2 bg-gray-200 text-gray-700 rounded-lg text-sm font-bold hover:bg-gray-300">Test Email</button><button type="submit" class="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-bold shadow-sm hover:bg-blue-700">Save Configuration</button></div>
+                                <div id="brevo-diagnostics" class="hidden p-3 rounded-lg border bg-gray-50 text-xs text-gray-700"></div>
+                                <div class="flex flex-wrap justify-end gap-2 pt-2"><button type="button" onclick="runBrevoDiagnostics()" class="px-4 py-2 bg-amber-100 text-amber-800 rounded-lg text-sm font-bold hover:bg-amber-200"><i class="fa-solid fa-stethoscope mr-1"></i>Diagnostics</button><button type="button" onclick="testEmail()" class="px-4 py-2 bg-gray-200 text-gray-700 rounded-lg text-sm font-bold hover:bg-gray-300">Test Email</button><button type="submit" class="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-bold shadow-sm hover:bg-blue-700">Save Configuration</button></div>
                             </form>
+
                         </div>
                         <div class="flex flex-col gap-6">
                             <div class="bg-white rounded-xl shadow-sm border p-6">
@@ -868,7 +886,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
                     </div>
                     <div class="bg-white rounded-xl shadow-sm border overflow-hidden">
                         <table class="w-full text-left border-collapse text-sm" id="email-logs-table">
-                            <thead class="bg-gray-50 border-b text-xs uppercase text-gray-500 font-bold"><tr><th class="p-3">Date/Time</th><th class="p-3">Recipient</th><th class="p-3">Subject</th><th class="p-3">Type</th><th class="p-3">Status</th><th class="p-3 text-center">Retries</th><th class="p-3">Error</th></tr></thead>
+                            <thead class="bg-gray-50 border-b text-xs uppercase text-gray-500 font-bold"><tr><th class="p-3">Date/Time</th><th class="p-3">Recipient</th><th class="p-3">Subject</th><th class="p-3">Type</th><th class="p-3">Status</th><th class="p-3">Provider / Delivery</th><th class="p-3 text-center">Retries</th><th class="p-3">Error</th></tr></thead>
                             <tbody id="email-logs-body" class="divide-y divide-gray-100"></tbody>
                         </table>
                     </div>
@@ -1063,7 +1081,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
                 rooms: rooms, boarders: boarders, 
                 transactions: [], tickets: [], 
                 reservations: [], waitingList: [], formerBoarders: [],
-                emailConfig: { enabled: false, server: '', port: '', email: '', pass: '', name: '' },
+                emailConfig: { enabled: false, provider: 'brevo-api', server: 'smtp-relay.brevo.com', port: 587, smtpLogin: '', email: '', pass: '', name: '' },
                 settings: { reminderDays: 7 }, audit: [], emailLogs: [],
                 receiptArchive: [], floors: [],
                 lastUpdate: new Date().toISOString() 
@@ -1075,7 +1093,8 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             if(!bhmsData.reservations) bhmsData.reservations = [];
             if(!bhmsData.waitingList) bhmsData.waitingList = [];
             if(!bhmsData.formerBoarders) bhmsData.formerBoarders = [];
-            if(!bhmsData.emailConfig) bhmsData.emailConfig = { enabled: false, server: '', port: '', email: '', pass: '', name: '' };
+            if(!bhmsData.emailConfig) bhmsData.emailConfig = { enabled: false, provider: 'brevo-api', server: 'smtp-relay.brevo.com', port: 587, smtpLogin: '', email: '', pass: '', name: '' };
+            if(!bhmsData.emailConfig.provider) bhmsData.emailConfig.provider = 'brevo-api';
             if(!bhmsData.settings) bhmsData.settings = { reminderDays: 7 };
             if(!bhmsData.audit) bhmsData.audit = [];
             if(!bhmsData.emailLogs) bhmsData.emailLogs = [];
@@ -1260,8 +1279,8 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
                         body: JSON.stringify(payload)
                     });
                     const out = await response.json().catch(() => ({}));
-                    if (response.ok) showToast(`Email queued: ${type} to ${toEmail}`, 'info');
-                    else showToast(`Failed to send email to ${toEmail}`, 'error');
+                    if (response.ok && out && out.success !== false) showToast(`Email sent to ${toEmail} (provider accepted${out.messageId ? ' · ' + out.messageId : ''})`, 'success');
+                    else showToast(`Email NOT sent to ${toEmail}: ${(out && (out.error || out.reason)) || 'provider rejected the message'}`, 'error');
                     refreshEmailLogsFromServer();
                     return out;
                 } catch (error) {
@@ -1313,10 +1332,11 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
                     })
                 });
 
-                if (response.ok) {
-                    showToast(`Email queued: ${subject} to ${toEmail}`, 'info');
+                const out = await response.json().catch(() => ({}));
+                if (response.ok && out.success !== false) {
+                    showToast(`Email sent to ${toEmail}${out.messageId ? ' · ' + out.messageId : ''}`, 'success');
                 } else {
-                    showToast(`Failed to send email to ${toEmail}`, 'error');
+                    showToast(`Email NOT sent to ${toEmail}: ${out.error || 'provider rejected the message'}`, 'error');
                 }
             } catch (error) {
                 console.error("Email Error", error);
@@ -3994,8 +4014,16 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
         }
 
         function renderSettings() {
-            document.getElementById('smtp-enabled').checked = bhmsData.emailConfig.enabled;
-            document.getElementById('smtp-server').value = bhmsData.emailConfig.server; document.getElementById('smtp-port').value = bhmsData.emailConfig.port; document.getElementById('smtp-gmail').value = bhmsData.emailConfig.email; document.getElementById('smtp-pass').value = bhmsData.emailConfig.pass;
+            const ec = bhmsData.emailConfig || (bhmsData.emailConfig = {});
+            document.getElementById('smtp-enabled').checked = !!ec.enabled;
+            document.getElementById('email-provider').value = ec.provider || 'brevo-api';
+            document.getElementById('smtp-server').value = ec.server || '';
+            document.getElementById('smtp-port').value = ec.port || '';
+            document.getElementById('smtp-login').value = ec.smtpLogin || '';
+            document.getElementById('smtp-gmail').value = ec.email || '';
+            document.getElementById('smtp-pass').value = ec.pass || '';
+            document.getElementById('smtp-test-to').value = ec.testRecipient || '';
+            onEmailProviderChange();
             const s = bhmsData.settings || {};
             document.getElementById('set-remind-days').value = s.reminderDays || 7;
             document.getElementById('auto-reminders-enabled').checked = s.autoRemindersEnabled !== false;
@@ -4271,46 +4299,81 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             w.document.close();
         }
 
+        function onEmailProviderChange() {
+            const p = document.getElementById('email-provider').value;
+            document.getElementById('smtp-fields').classList.toggle('hidden', p === 'brevo-api');
+            document.getElementById('brevo-api-note').classList.toggle('hidden', p === 'smtp');
+            if (p === 'brevo-smtp') {
+                const host = document.getElementById('smtp-server');
+                const port = document.getElementById('smtp-port');
+                if (!host.value) host.value = 'smtp-relay.brevo.com';
+                if (!port.value) port.value = 587;
+            }
+        }
+
+        function collectEmailConfig() {
+            return {
+                enabled: document.getElementById('smtp-enabled').checked,
+                provider: document.getElementById('email-provider').value,
+                server: document.getElementById('smtp-server').value,
+                port: document.getElementById('smtp-port').value,
+                smtpLogin: document.getElementById('smtp-login').value,
+                email: document.getElementById('smtp-gmail').value,
+                pass: document.getElementById('smtp-pass').value,
+                testRecipient: document.getElementById('smtp-test-to').value
+            };
+        }
+
         function saveEmailSettings(e) {
             e.preventDefault();
-            // Transport settings only — the sender NAME comes from White Label Branding.
-            bhmsData.emailConfig = { enabled: document.getElementById('smtp-enabled').checked, server: document.getElementById('smtp-server').value, port: document.getElementById('smtp-port').value, email: document.getElementById('smtp-gmail').value, pass: document.getElementById('smtp-pass').value };
+            // Transport settings only — the sender NAME comes from White Label Branding,
+            // and Brevo API keys live in the server environment (never in the browser).
+            bhmsData.emailConfig = collectEmailConfig();
             saveData(); showToast('Email settings saved!');
             fetch('/api/reload-config', { method: 'POST' }).catch(()=>{});
         }
 
-        function saveMaintenanceSettings(e) {
-            e.preventDefault();
-            const s = bhmsData.settings || (bhmsData.settings = {});
-            s.reminderDays = parseInt(document.getElementById('set-remind-days').value) || 7;
-            s.autoRemindersEnabled = document.getElementById('auto-reminders-enabled').checked;
-            s.dailyTime = document.getElementById('set-daily-time').value || '08:00';
-            s.reminderSchedule = document.getElementById('set-schedule').value.split(',').map(x=>parseInt(x.trim())).filter(n=>!isNaN(n));
-            s.retryAttempts = parseInt(document.getElementById('set-retry-attempts').value) || 3;
-            s.retryIntervalMinutes = parseInt(document.getElementById('set-retry-interval').value) || 5;
-            s.replyTo = document.getElementById('set-replyto').value;
-            // Branding fields are owned by White Label only — purge any legacy copy.
-            delete s.signature; delete s.footer; delete s.dormName; delete s.dormLogoUrl; delete s.contactInfo;
-            saveData(); showToast('Automation settings saved!');
-            fetch('/api/reload-config', { method: 'POST' }).catch(()=>{});
+        async function runBrevoDiagnostics() {
+            const box = document.getElementById('brevo-diagnostics');
+            box.classList.remove('hidden');
+            box.innerHTML = 'Running Brevo diagnostics…';
+            try {
+                const d = await (await fetch('/api/brevo/diagnostics')).json();
+                const yn = v => v ? '<span class="text-green-700 font-bold">yes</span>' : '<span class="text-red-700 font-bold">no</span>';
+                box.innerHTML = `
+                    <div class="space-y-1">
+                        <div><b>Transport:</b> ${d.provider} &nbsp;|&nbsp; <b>Brevo mode:</b> ${d.brevoMode}</div>
+                        <div><b>LOVABLE_API_KEY:</b> ${yn(d.env.LOVABLE_API_KEY)} &nbsp; <b>BREVO_API_KEY:</b> ${yn(d.env.BREVO_API_KEY)} &nbsp; <b>BREVO_DIRECT_API_KEY:</b> ${yn(d.env.BREVO_DIRECT_API_KEY)}</div>
+                        <div><b>Brevo account:</b> ${(d.account && d.account.email) || '—'}</div>
+                        <div><b>Sender:</b> ${d.sender || '—'} — verified: ${d.senderVerified === null ? '—' : yn(d.senderVerified)}</div>
+                        <div><b>Verified senders:</b> ${(d.senders||[]).map(s=>s.email+(s.active?'':' (unconfirmed)')).join(', ') || 'none'}</div>
+                        ${(d.problems||[]).length ? '<ul class="list-disc pl-5 text-red-700 font-medium">'+d.problems.map(p=>`<li>${p}</li>`).join('')+'</ul>' : '<div class="text-green-700 font-bold">No problems detected.</div>'}
+                    </div>`;
+            } catch (e) { box.innerHTML = '<span class="text-red-700">Diagnostics failed: '+e.message+'</span>'; }
         }
 
         function testEmail() {
-            if(!document.getElementById('smtp-enabled').checked) { showToast("Enable SMTP first.", "error"); return; }
-            showToast('Testing SMTP connection…', 'info');
+            if(!document.getElementById('smtp-enabled').checked) { showToast("Enable email notifications first.", "error"); return; }
+            const cfg = collectEmailConfig();
+            showToast('Testing email transport…', 'info');
             const ctrl = new AbortController();
-            const timer = setTimeout(()=>ctrl.abort(), 30000);
-            fetch('/api/test-email', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(bhmsData.emailConfig), signal: ctrl.signal })
+            const timer = setTimeout(()=>ctrl.abort(), 60000);
+            fetch('/api/test-email', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(cfg), signal: ctrl.signal })
               .then(async r => {
                   const raw = await r.text();
                   let d; try { d = JSON.parse(raw); } catch(_) { d = { error: 'HTTP '+r.status+': '+(raw||'no response body') }; }
-                  showToast(d.success ? 'SMTP OK — test email sent.' : ('Failed: '+(d.error||d.details||('HTTP '+r.status))), d.success?'success':'error');
+                  showToast(d.success
+                      ? ('Delivered — '+(d.message||'')+(d.messageId?(' [id '+d.messageId+']'):''))
+                      : ('Failed: '+(d.error||d.details||('HTTP '+r.status))), d.success?'success':'error');
+                  if (!d.success) runBrevoDiagnostics();
+                  refreshEmailLogsFromServer();
               })
               .catch(e => showToast(e.name === 'AbortError'
-                  ? 'Timed out — the SMTP server never replied (your host may block outbound SMTP ports).'
+                  ? 'Timed out — the provider never replied (SMTP ports are often blocked on hosted plans; use the Brevo API method).'
                   : ('Request failed: '+e.message), 'error'))
               .finally(()=>clearTimeout(timer));
         }
+
 
 
         async function runRemindersNow() {
@@ -4336,8 +4399,8 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             });
             body.innerHTML = logs.length ? logs.map(l=>{
                 const stColor = (l.status||'').startsWith('Sent')?'bg-green-100 text-green-800':(l.status||'').startsWith('Failed')||(l.status||'').startsWith('Error')?'bg-red-100 text-red-800':'bg-yellow-100 text-yellow-800';
-                return `<tr><td class="p-3 text-xs">${l.date||''}</td><td class="p-3">${l.to||''}</td><td class="p-3">${l.subject||''}</td><td class="p-3"><span class="text-xs font-bold uppercase text-gray-600">${l.type||'—'}</span></td><td class="p-3"><span class="text-xs font-bold px-2 py-1 rounded ${stColor}">${l.status||''}</span></td><td class="p-3 text-center">${l.retries||0}</td><td class="p-3 text-xs text-red-600">${l.error||''}</td></tr>`;
-            }).join('') : '<tr><td colspan="7" class="p-6 text-center text-gray-500">No email activity yet.</td></tr>';
+                return `<tr><td class="p-3 text-xs">${l.date||''}</td><td class="p-3">${l.to||''}</td><td class="p-3">${l.subject||''}</td><td class="p-3"><span class="text-xs font-bold uppercase text-gray-600">${l.type||'—'}</span></td><td class="p-3"><span class="text-xs font-bold px-2 py-1 rounded ${stColor}">${l.status||''}</span></td><td class="p-3 text-xs text-gray-600">${l.provider||'—'}${l.delivery?(' · '+l.delivery):''}${l.messageId?`<div class="text-[10px] text-gray-400 break-all">${l.messageId}</div>`:''}</td><td class="p-3 text-center">${l.retries||0}</td><td class="p-3 text-xs text-red-600">${l.error||''}</td></tr>`;
+            }).join('') : '<tr><td colspan="8" class="p-6 text-center text-gray-500">No email activity yet.</td></tr>';
         }
 
         function _getEmailLogsSorted() {
