@@ -7,9 +7,21 @@ services:
     startCommand: npm start
     healthCheckPath: /
     envVars:
+      - key: NODE_VERSION
+        value: 20
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false
-      - key: NODE_VERSION
-        value: 20
+      # Brevo through the Lovable connector gateway (recommended)
+      - key: LOVABLE_API_KEY
+        sync: false
+      - key: BREVO_API_KEY
+        sync: false
+      - key: BREVO_GATEWAY_URL
+        value: https://connector-gateway.lovable.dev/brevo
+      # Direct Brevo API alternative (leave blank if using the gateway)
+      - key: BREVO_DIRECT_API_KEY
+        sync: false
+      - key: BREVO_DIRECT_API_URL
+        value: https://api.brevo.com/v3
