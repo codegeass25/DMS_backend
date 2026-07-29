@@ -4297,9 +4297,21 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
 
         function testEmail() {
             if(!document.getElementById('smtp-enabled').checked) { showToast("Enable SMTP first.", "error"); return; }
-            fetch('/api/test-email', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(bhmsData.emailConfig) })
-              .then(r=>r.json()).then(d=>{ showToast(d.success ? 'SMTP OK — test email sent.' : ('Failed: '+(d.error||'unknown')), d.success?'success':'error'); });
+            showToast('Testing SMTP connection…', 'info');
+            const ctrl = new AbortController();
+            const timer = setTimeout(()=>ctrl.abort(), 30000);
+            fetch('/api/test-email', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(bhmsData.emailConfig), signal: ctrl.signal })
+              .then(async r => {
+                  const raw = await r.text();
+                  let d; try { d = JSON.parse(raw); } catch(_) { d = { error: 'HTTP '+r.status+': '+(raw||'no response body') }; }
+                  showToast(d.success ? 'SMTP OK — test email sent.' : ('Failed: '+(d.error||d.details||('HTTP '+r.status))), d.success?'success':'error');
+              })
+              .catch(e => showToast(e.name === 'AbortError'
+                  ? 'Timed out — the SMTP server never replied (your host may block outbound SMTP ports).'
+                  : ('Request failed: '+e.message), 'error'))
+              .finally(()=>clearTimeout(timer));
         }
+
 
         async function runRemindersNow() {
             showToast('Running reminder engine…','info');
