@@ -757,9 +757,15 @@ function buildTransport(cfg) {
         port,
         secure: port === 465,
         auth: { user: cfg.email, pass: cfg.pass },
-        tls: { rejectUnauthorized: false }
+        tls: { rejectUnauthorized: false },
+        // Hosts like Render can silently drop outbound SMTP; without these the
+        // socket hangs forever and the Test Email button never gets a response.
+        connectionTimeout: 15000,
+        greetingTimeout: 15000,
+        socketTimeout: 20000
     });
 }
+
 
 async function verifySmtpHandshake(cfg) {
     const invalid = validateSmtpConfig(cfg);
