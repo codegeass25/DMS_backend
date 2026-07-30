@@ -1488,10 +1488,20 @@ function tenantRows(c, d) {
 /* Central helper: every email template shows "ENTIRE ROOM" (not Bed 1 /
  * Bed —) for entire-room reservations and check-ins. Uses the same rule
  * as the front-end getReceiptAccommodation(): entire_room wins over bedNo. */
+function isEntireRoomData(d) {
+    return !!(d && (d.occupancyType === 'entire_room' || d.type === 'room' ||
+        String(d.accommodation || '').toUpperCase() === 'ENTIRE ROOM'));
+}
 function bedRow(d) {
-    var isEntire = d && (d.occupancyType === 'entire_room' || d.type === 'room');
-    if (isEntire) return ['Accommodation', 'ENTIRE ROOM'];
+    // Entire Room always wins: no bed number, no "Bed 1" fallback, ever.
+    if (isEntireRoomData(d)) return ['Accommodation', 'ENTIRE ROOM'];
     return ['Bed Number', esc((d && d.bedNo) || '—')];
+}
+/* Room assignment line used wherever a combined label is preferable. */
+function roomAssignment(d) {
+    var room = esc((d && (d.roomNumber || d.roomId)) || '—');
+    return isEntireRoomData(d) ? (room + ' (ENTIRE ROOM)')
+        : (d && d.bedNo ? room + ' - Bed ' + esc(d.bedNo) : room);
 }
 
 const EMAIL_TYPES = {
@@ -1642,9 +1652,13 @@ const EMAIL_TYPES = {
         rows: (c, d) => [
             ['Tenant Name', esc(d.name || '—')],
             ['Previous Room', esc(d.previousRoom || '—')],
-            ['Previous Bed', esc(d.previousBed || '—')],
+            (d.previousOccupancyType === 'entire_room' || String(d.previousBed || '').toUpperCase() === 'ENTIRE ROOM')
+                ? ['Previous Accommodation', 'ENTIRE ROOM']
+                : ['Previous Bed', esc(d.previousBed || '—')],
             ['New Room Number', esc(d.roomNumber || d.roomId || '—')],
-            ['New Bed Number', esc(d.bedNo || '—')],
+            isEntireRoomData(d)
+                ? ['New Accommodation', 'ENTIRE ROOM']
+                : ['New Bed Number', esc(d.bedNo || '—')],
             ['Transfer Date', fmtDate(d.transferDate || new Date())],
             ['Monthly Rent', money(c, d.monthlyRent || 0)]
         ]
