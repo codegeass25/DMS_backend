@@ -501,6 +501,142 @@ function reconcileEntireRoomState(v) {
     return v;
 }
 
+/* ====================================================================
+ * OCCUPANCY — SINGLE SOURCE OF TRUTH
+ * --------------------------------------------------------------------
+ * ONE calculation consumed by BOTH the Admin Dormitory Map and the
+ * Tenant Dormitory Map (and every report / modal that shows counters).
+ * The frontends must render `room.occupancy` verbatim and must never
+ * recompute occupancy from beds themselves.
+ *
+ *   Entire Room + Checked-in  -> 1 OCC  / 0 RES  / ENTIRE ROOM
+ *   Entire Room + Reserved    -> 0 OCC  / 1 RES  / ENTIRE ROOM
+ *   Bed Space                 -> unchanged, real per-bed counts
+ * ==================================================================== */
+const ENTIRE_ROOM_ACTIVE_STATUSES = ['Active', 'Reserved', 'Pending', 'Approved'];
+
+function findEntireRoomOwner(db, room) {
+    const boarders = Array.isArray(db.boarders) ? db.boarders : [];
+    const inRoom = boarders.filter(b => b && String(b.roomId) === String(room.id));
+    if (room.entireRoomBoarderId) {
+        const owner = inRoom.find(b => b.id === room.entireRoomBoarderId);
+        if (owner) return owner;
+    }
+    return inRoom.find(b => b.occupancyType === 'entire_room') || null;
+}
+
+function findEntireRoomReservation(db, room) {
+    const reservations = Array.isArray(db.reservations) ? db.reservations : [];
+    return reservations.find(r => r && String(r.roomId) === String(room.id) &&
+        (r.type === 'room' || r.occupancyType === 'entire_room' || r.reservationType === 'Entire Room') &&
+        (r.status === 'Checked-in' || ENTIRE_ROOM_ACTIVE_STATUSES.includes(r.status))) || null;
+}
+
+/**
+ * Authoritative occupancy for one room.
+ * Returns a render-ready descriptor: counters, badge, progress and the exact
+ * list of chips (icons) the map must draw — nothing is left to the client.
+ */
+function computeRoomOccupancy(db, room) {
+    const capacity = Number(room.capacity || (Array.isArray(room.beds) ? room.beds.length : 0)) || 0;
+    if (room.type === 'Admin') {
+        return {
+            roomId: room.id, mode: 'admin', entireRoom: false, capacity,
+            occupied: 0, reserved: 0, available: 0, percent: 0,
+            status: 'Admin', occupancyLabel: 'Admin', bedLabel: '—',
+            chips: [], showResChip: false, showFreeChip: false, locked: true,
+            footer: { occ: '0 OCC', res: '', line2: 'ADMIN' }
+        };
+    }
+
+    const beds = Array.isArray(room.beds) ? room.beds : [];
+    const owner = findEntireRoomOwner(db, room);
+    const entireRes = findEntireRoomReservation(db, room);
+    const checkedIn = !!owner || !!(entireRes && entireRes.status === 'Checked-in');
+    const reservedWhole = !checkedIn && !!entireRes;
+
+    /* ---- Case A: Entire Room, checked-in -> exactly ONE occupant ---- */
+    if (checkedIn) {
+        return {
+            roomId: room.id, mode: 'entire', entireRoom: true, capacity,
+            occupied: 1, reserved: 0, available: 0, percent: 100,
+            status: 'Fully Occupied',
+            occupancyLabel: 'ENTIRE ROOM', bedLabel: 'ENTIRE ROOM',
+            occupantName: (owner && owner.name) || (entireRes && entireRes.name) || 'Occupant',
+            occupantId: (owner && owner.id) || (entireRes && entireRes.boarderId) || null,
+            reservationId: entireRes ? entireRes.id : null,
+            chips: [{ kind: 'occ', title: 'Entire room occupant' }],
+            showResChip: false, showFreeChip: false, locked: true,
+            footer: { occ: '1 OCC', res: '', line2: 'ENTIRE ROOM' }
+        };
+    }
+
+    /* ---- Case B: Entire Room, reserved -> exactly ONE reservation ---- */
+    if (reservedWhole) {
+        return {
+            roomId: room.id, mode: 'entire', entireRoom: true, capacity,
+            occupied: 0, reserved: 1, available: 0, percent: 0,
+            status: 'Reserved',
+            occupancyLabel: 'ENTIRE ROOM', bedLabel: 'ENTIRE ROOM',
+            occupantName: entireRes.name || 'Reservation holder',
+            occupantId: entireRes.boarderId || null,
+            reservationId: entireRes.id,
+            chips: [{ kind: 'res', title: 'Entire room reservation' }],
+            showResChip: true, showFreeChip: false, locked: true,
+            footer: { occ: '0 OCC', res: '1 RES', line2: 'ENTIRE ROOM' }
+        };
+    }
+
+    /* ---- Bed space: unchanged behaviour, real per-bed counts ---- */
+    const occupied = beds.filter(b => b && (b.isOccupied || b.boarderId)).length;
+    const reserved = beds.filter(b => b && b.isReserved && !b.isOccupied).length;
+    const available = Math.max(0, capacity - occupied - reserved);
+    let status = 'Available';
+    if (capacity > 0 && available === 0 && occupied > 0) status = 'Fully Occupied';
+    else if (capacity > 0 && available === 0 && reserved > 0) status = 'Reserved';
+    else if (occupied === 0 && reserved > 0) status = 'Reserved';
+    else if (occupied + reserved > 0) status = 'Partially Occupied';
+
+    return {
+        roomId: room.id, mode: 'bed', entireRoom: false, capacity,
+        occupied, reserved, available,
+        percent: capacity ? Math.round((occupied / capacity) * 100) : 0,
+        status, occupancyLabel: 'Bed Space', bedLabel: '',
+        chips: beds.slice(0, 12).map(b => ({
+            kind: (b && (b.isOccupied || b.boarderId)) ? 'occ' : (b && b.isReserved ? 'res' : 'free'),
+            title: 'Bed ' + (b && (b.bedNo || b.number || b.id) || '')
+        })).concat(beds.length > 12 ? [{ kind: 'more', title: '+' + (beds.length - 12) + ' more', label: '+' + (beds.length - 12) }] : []),
+        showResChip: reserved > 0,
+        showFreeChip: available > 0,
+        locked: false,
+        footer: { occ: occupied + ' OCC', res: reserved ? reserved + ' RES' : '', line2: available + ' FREE' }
+    };
+}
+
+/** Occupancy for every room — one payload, both portals. */
+function computeOccupancyMap(db) {
+    const out = {};
+    (Array.isArray(db.rooms) ? db.rooms : []).forEach(room => {
+        if (!room) return;
+        out[String(room.id)] = computeRoomOccupancy(db, room);
+    });
+    return out;
+}
+
+/** Attach the authoritative occupancy onto each room of an outgoing payload. */
+function withOccupancy(db) {
+    try {
+        const map = computeOccupancyMap(db);
+        (Array.isArray(db.rooms) ? db.rooms : []).forEach(room => {
+            if (room) room.occupancy = map[String(room.id)] || null;
+        });
+        db.occupancyMap = map;
+    } catch (e) { console.error('[OCCUPANCY]', e.message); }
+    return db;
+}
+
+
+
 function normalizeStructure(data) {
     const v = data && typeof data === 'object' ? data : {};
     v.rooms = Array.isArray(v.rooms) ? v.rooms : [];
@@ -2378,9 +2514,32 @@ function autoReceiptPendingTransactions(db, previous, req) {
  * API ROUTES — all existing routes preserved, plus new ones
  * ==================================================================== */
 app.get('/api/data', (req, res) => {
-    try { res.status(200).json(readStorage()); }
+    // Every payload carries the backend-computed occupancy so the Admin and
+    // Tenant maps render identical numbers without any client-side maths.
+    try { res.status(200).json(withOccupancy(readStorage())); }
     catch (e) { res.status(500).json({ error: 'Data read failed.', details: e.message }); }
 });
+
+/** Occupancy Single Source of Truth — consumed by BOTH dormitory maps. */
+app.get('/api/occupancy', (req, res) => {
+    try {
+        const db = readStorage();
+        const map = computeOccupancyMap(db);
+        const list = Object.values(map);
+        res.json({
+            rooms: map,
+            totals: {
+                capacity: list.reduce((s, o) => s + (o.mode === 'admin' ? 0 : o.capacity), 0),
+                occupied: list.reduce((s, o) => s + o.occupied, 0),
+                reserved: list.reduce((s, o) => s + o.reserved, 0),
+                available: list.reduce((s, o) => s + o.available, 0),
+                entireRooms: list.filter(o => o.entireRoom).length
+            },
+            serverTime: new Date().toISOString()
+        });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 
 app.post('/api/data', (req, res) => {
     try {
@@ -2396,7 +2555,10 @@ app.post('/api/data', (req, res) => {
         const existing = readStorage();
         const incoming = req.body;
         const merged = { ...existing, ...incoming };
-        // Force-preserve emailLogs from disk (frontend sends none)
+        // Occupancy is DERIVED server state. Never accept or persist a client copy.
+        delete merged.occupancyMap;
+        if (Array.isArray(merged.rooms)) merged.rooms.forEach(r => { if (r) delete r.occupancy; });
+
         merged.emailLogs = Array.isArray(existing.emailLogs) ? existing.emailLogs : [];
         // Force-preserve emailCounter from disk (frontend sends none)
         merged.emailCounter = (existing.emailCounter && typeof existing.emailCounter === 'object') ? existing.emailCounter : {};
@@ -3628,19 +3790,26 @@ app.post('/api/chat/message', async (req, res) => {
                 verificationStatus: verdict.status,
                 verificationReason: verdict.reason,
                 duplicateOf: verdict.duplicateOf || null,
-                adminStatus: verdict.status === 'Verified' ? 'Auto-Approved' : 'Awaiting Review',
+                /* OCR NEVER APPROVES A PAYMENT. It only judges whether the
+                 * uploaded document looks authentic. Final approval authority
+                 * always belongs to Staff/Admin, so every OCR outcome except an
+                 * outright rejection lands in "Pending Staff Approval". */
+                adminStatus: verdict.status === 'Rejected' ? 'Rejected' : 'Awaiting Review',
+                workflowStage: verdict.status === 'Rejected' ? 'Rejected' : 'Pending Staff Approval',
                 credited: false,
                 creditAmount: 0
             };
             fresh.receiptArchive.push(receipt);
-            if (verdict.status === 'Verified') creditReservation(fresh, receipt);
+            /* No crediting here — credits are created only on Staff/Admin approval. */
 
             const summary = verdict.status === 'Verified'
-                ? 'Receipt verified automatically. Reference ' + receipt.referenceNumber + ' · ' +
-                  BrandingService.money(BrandingService.get(fresh), receipt.amount) + ' credited to reservation ' + t.reservationId + '.'
+                ? 'Receipt passed OCR verification (reference ' + receipt.referenceNumber + ' · ' +
+                  BrandingService.money(BrandingService.get(fresh), receipt.amount) +
+                  '). It is now awaiting Staff/Admin approval — no payment has been credited yet.'
                 : verdict.status === 'Rejected'
                     ? 'Receipt rejected: ' + verdict.reason
                     : 'Manual Verification Required — ' + verdict.reason;
+
             fresh.chatMessages.push({
                 id: 'MSG-' + Date.now() + 'S', threadId: t.id, role: 'system', kind: 'ocr',
                 text: summary, receiptId: receipt.id, at: new Date().toISOString(),
@@ -3673,6 +3842,82 @@ app.post('/api/chat/message', async (req, res) => {
 
 /* ------------------- OFFICIAL RECEIPTS (OR) API --------------------- */
 
+/**
+ * RECEIPT ARCHIVE ROW — the ONLY shape the Receipt Archive may render.
+ * Every field is resolved on the backend, so the UI can never print
+ * "undefined". Uploaded GCash images, OCR text/JSON/confidence and any
+ * other OCR metadata are deliberately NOT part of this projection: those
+ * are supporting documents and belong exclusively to the OCR Review screen.
+ */
+function archiveRow(db, r) {
+    const dash = v => {
+        const s = (v === null || v === undefined) ? '' : String(v).trim();
+        return (s && s !== 'undefined' && s !== 'null') ? s : '—';
+    };
+    const boarder = (db.boarders || []).find(b => String(b.id) === String(r.boarderId)) || null;
+    const reservation = (db.reservations || []).find(x => String(x.id) === String(r.reservationId)) || null;
+    const room = (db.rooms || []).find(x =>
+        String(x.id) === String((boarder && boarder.roomId) || (reservation && reservation.roomId))) || null;
+    const isEntire = String(r.reservationType || '').toLowerCase().indexOf('entire') === 0 ||
+        String(r.bedNumber || '').toUpperCase() === 'ENTIRE ROOM' ||
+        (reservation && (reservation.type === 'room' || reservation.occupancyType === 'entire_room'));
+
+    const amount = Number(r.amount || 0);
+    const symbol = r.currencySymbol || BrandingService.get(db).currencySymbol || '₱';
+
+    return {
+        id: r.id,
+        orNumber: dash(r.orNumber),
+        orDate: r.issuedAt || r.dateTime || r.datePaid || null,
+        orDateDisplay: dash(new Date(r.issuedAt || r.dateTime || Date.now()).toLocaleString()),
+        boarder: dash(r.tenantName || (boarder && boarder.name) || (reservation && reservation.name)),
+        tenantEmail: dash(r.tenantEmail || (boarder && boarder.email) || (reservation && reservation.email)),
+        room: dash(r.roomNumber || (room && (room.roomName || ('Room ' + room.roomNumber)))),
+        bed: isEntire ? 'ENTIRE ROOM' : dash(r.bedNumber || (reservation && reservation.bedNo)),
+        occupancyType: isEntire ? 'Entire Room' : 'Bed Space',
+        amount,
+        amountDisplay: symbol + amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
+        paymentMethod: dash(r.paymentMethod),
+        paymentReference: dash(r.paymentReference),
+        category: dash(r.category),
+        reportBucket: dash(r.reportBucket),
+        details: dash(r.notes || (r.category ? r.category + ' — Official Receipt ' + r.orNumber : '')),
+        status: dash(r.status || 'Issued'),
+        approvedBy: dash(r.approvedBy),
+        reservationId: r.reservationId || null,
+        boarderId: r.boarderId || null,
+        viewUrl: '/api/official-receipts/' + encodeURIComponent(r.id) + '/print',
+        downloadUrl: '/api/official-receipts/' + encodeURIComponent(r.id) + '/print?download=1'
+    };
+}
+
+/**
+ * RECEIPT ARCHIVE — system-generated Official Receipts ONLY.
+ * This is what the Receipt Archive module must consume.
+ */
+app.get('/api/receipt-archive', (req, res) => {
+    try {
+        const db = OR.ensure(readStorage());
+        const { boarderId, reservationId, status, q } = req.query || {};
+        let list = db.officialReceipts.slice();
+        if (boarderId)     list = list.filter(r => String(r.boarderId) === String(boarderId));
+        if (reservationId) list = list.filter(r => String(r.reservationId) === String(reservationId));
+        if (status)        list = list.filter(r => r.status === status);
+        list.sort((a, b) => String(b.issuedAt || b.dateTime).localeCompare(String(a.issuedAt || a.dateTime)));
+        let rows = list.map(r => archiveRow(db, r));
+        if (q) {
+            const needle = String(q).toLowerCase();
+            rows = rows.filter(r => [r.orNumber, r.boarder, r.room, r.bed, r.paymentMethod, r.paymentReference]
+                .join(' ').toLowerCase().includes(needle));
+        }
+        res.json({
+            receipts: rows,
+            count: rows.length,
+            total: rows.filter(r => r.status !== 'Void').reduce((s, r) => s + r.amount, 0)
+        });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 /** List Official Receipts. Filter by boarder, reservation, category or bucket. */
 app.get('/api/official-receipts', (req, res) => {
     try {
@@ -3688,6 +3933,86 @@ app.get('/api/official-receipts', (req, res) => {
         res.json(list);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+/**
+ * PERMANENT DELETE of an Official Receipt and every record derived from it.
+ * Returns an accurate report of what was actually removed from storage.
+ */
+app.delete('/api/official-receipts/:id', (req, res) => {
+    try {
+        const db = ensureFinancialCollections(OR.ensure(readStorage()));
+        const target = db.officialReceipts.find(r =>
+            String(r.id) === String(req.params.id) || String(r.orNumber) === String(req.params.id));
+        if (!target) return res.status(404).json({ error: 'Official Receipt not found.', deleted: 0 });
+
+        const key = 'OR:' + target.orNumber;
+        const before = {
+            officialReceipts: db.officialReceipts.length,
+            financialReports: db.financialReports.length,
+            paymentHistory: db.paymentHistory.length,
+            ledger: db.ledger.length,
+            transactions: db.transactions.length,
+            reservationPaymentHistory: db.reservationPaymentHistory.length,
+            checkinPaymentHistory: db.checkinPaymentHistory.length
+        };
+
+        db.officialReceipts = db.officialReceipts.filter(r => r.id !== target.id);
+        db.financialReports = db.financialReports.filter(r =>
+            String(r.officialReceiptId) !== String(target.id) && String(r.orNumber) !== String(target.orNumber));
+        ['paymentHistory', 'ledger', 'transactions', 'reservationPaymentHistory', 'checkinPaymentHistory']
+            .forEach(k => { db[k] = db[k].filter(r => r.idempotencyKey !== key && String(r.officialReceiptId) !== String(target.id)); });
+        db.billingRecords = db.transactions;
+
+        /* Release the links so the source transaction can be re-receipted. */
+        (db.receiptArchive || []).forEach(rc => {
+            if (String(rc.officialReceiptId) === String(target.id)) { rc.officialReceiptId = null; rc.orNumber = null; }
+        });
+        (db.reservations || []).forEach(rv => {
+            if (String(rv.officialReceiptId) === String(target.id)) { rv.officialReceiptId = null; rv.orNumber = null; }
+        });
+
+        const who = (req.mdmsUser && req.mdmsUser.name) || 'Administrator';
+        appendAuditEntry('Receipt Archive', 'Deleted Official Receipt ' + target.orNumber + ' by ' + who, req);
+        writeStorageAtomic(db);
+
+        res.json({
+            success: true,
+            deleted: 1,
+            orNumber: target.orNumber,
+            removed: {
+                officialReceipts: before.officialReceipts - db.officialReceipts.length,
+                financialReports: before.financialReports - db.financialReports.length,
+                paymentHistory: before.paymentHistory - db.paymentHistory.length,
+                ledger: before.ledger - db.ledger.length,
+                transactions: before.transactions - db.transactions.length,
+                reservationPaymentHistory: before.reservationPaymentHistory - db.reservationPaymentHistory.length,
+                checkinPaymentHistory: before.checkinPaymentHistory - db.checkinPaymentHistory.length
+            }
+        });
+    } catch (e) { res.status(500).json({ error: e.message, deleted: 0 }); }
+});
+
+/** Permanently delete an uploaded GCash/OCR review record (supporting doc). */
+app.delete('/api/receipts/:id', (req, res) => {
+    try {
+        const db = chatEnsure(readStorage());
+        const target = db.receiptArchive.find(r => String(r.id) === String(req.params.id));
+        if (!target) return res.status(404).json({ error: 'Receipt not found.', deleted: 0 });
+        if (target.adminStatus === 'Approved') {
+            return res.status(409).json({
+                error: 'This receipt was approved and is linked to Official Receipt ' + (target.orNumber || '—') +
+                       '. Void or delete the Official Receipt first.', deleted: 0
+            });
+        }
+        db.receiptArchive = db.receiptArchive.filter(r => String(r.id) !== String(target.id));
+        if (target.imagePath && db.uploads) delete db.uploads[target.imagePath];
+        db.chatMessages = (db.chatMessages || []).filter(m => String(m.receiptId || '') !== String(target.id));
+        appendAuditEntry('OCR Review', 'Deleted uploaded receipt ' + target.id, req);
+        writeStorageAtomic(db);
+        res.json({ success: true, deleted: 1, id: target.id });
+    } catch (e) { res.status(500).json({ error: e.message, deleted: 0 }); }
+});
+
 
 /** Financial report feed — every OR grouped into its report bucket. */
 app.get('/api/official-receipts/reports', (req, res) => {
@@ -3754,14 +4079,88 @@ app.get('/api/receipts', (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-/** Administrator approves or rejects a receipt (also for manual review). */
+/* ====================================================================
+ * SYNCHRONISED TRANSACTION LOGGING (SINGLE SOURCE OF TRUTH)
+ * One approved payment => exactly ONE entry in every financial module.
+ * Idempotent on the Official Receipt number, so a repeated approval,
+ * a retry or a double click can never duplicate a record.
+ * ==================================================================== */
+function ensureFinancialCollections(db) {
+    ['transactions', 'paymentHistory', 'ledger', 'reservationPaymentHistory',
+     'checkinPaymentHistory', 'financialReports'].forEach(k => {
+        db[k] = Array.isArray(db[k]) ? db[k] : [];
+    });
+    db.billingRecords = db.transactions;
+    return db;
+}
+
+function logApprovedPaymentEverywhere(db, ctx) {
+    ensureFinancialCollections(db);
+    const or = ctx.officialReceipt;
+    if (!or) return { created: false, reason: 'no official receipt' };
+    const key = 'OR:' + or.orNumber;
+    if (db.paymentHistory.some(p => p.idempotencyKey === key)) {
+        return { created: false, reason: 'already logged' };
+    }
+
+    const base = {
+        idempotencyKey: key,
+        orNumber: or.orNumber,
+        officialReceiptId: or.id,
+        date: (or.datePaid || or.issuedAt || new Date().toISOString()).split('T')[0],
+        dateTime: or.issuedAt,
+        amount: Number(or.amount || 0),
+        currency: or.currency,
+        paymentMethod: or.paymentMethod,
+        reference: or.paymentReference || '',
+        tenantName: or.tenantName,
+        tenantEmail: or.tenantEmail,
+        roomNumber: or.roomNumber,
+        bedNumber: or.bedNumber,
+        reservationType: or.reservationType,
+        reservationId: or.reservationId,
+        boarderId: or.boarderId,
+        category: or.category,
+        approvedBy: or.approvedBy,
+        status: 'Completed'
+    };
+
+    db.paymentHistory.push({ id: 'PH-' + or.id, ...base, module: 'Payment History' });
+    db.ledger.push({
+        id: 'LG-' + or.id, ...base, module: 'Tenant Ledger',
+        entryType: 'Credit', description: or.category + ' — Official Receipt ' + or.orNumber
+    });
+    db.transactions.push({
+        id: 'TX-OR-' + or.id, ...base, type: or.category,
+        details: or.category + ' received. Official Receipt ' + or.orNumber
+    });
+    db.billingRecords = db.transactions;
+
+    if (or.reservationId) {
+        db.reservationPaymentHistory.push({
+            id: 'RPH-' + or.id, ...base, module: 'Reservation Payment History'
+        });
+    }
+    if (ctx.checkIn && or.boarderId) {
+        db.checkinPaymentHistory.push({
+            id: 'CPH-' + or.id, ...base, module: 'Check-in Payment History'
+        });
+    }
+    return { created: true, key };
+}
+
+/** Staff/Admin approves or rejects a receipt. Approval is the ONLY gate. */
 app.post('/api/receipts/:id/decision', (req, res) => {
     try {
-        const db = chatEnsure(readStorage());
+        const db = ensureFinancialCollections(chatEnsure(readStorage()));
         const { decision, note, amount } = req.body || {};
         const rcp = db.receiptArchive.find(r => String(r.id) === String(req.params.id));
         if (!rcp) return res.status(404).json({ error: 'Receipt not found.' });
         if (!['approve', 'reject'].includes(decision)) return res.status(400).json({ error: 'decision must be approve or reject.' });
+        if (decision === 'approve' && rcp.adminStatus === 'Approved' && rcp.officialReceiptId) {
+            const already = (db.officialReceipts || []).find(o => String(o.id) === String(rcp.officialReceiptId));
+            return res.json({ success: true, alreadyApproved: true, receipt: rcp, officialReceipt: already || null });
+        }
 
         const who = (req.mdmsUser && req.mdmsUser.name) || 'Administrator';
         const nowIso = new Date().toISOString();
@@ -3772,13 +4171,15 @@ app.post('/api/receipts/:id/decision', (req, res) => {
             if (amount != null && Number(amount) > 0) rcp.amount = Number(amount);
             rcp.verificationStatus = 'Verified';
             rcp.adminStatus = 'Approved';
+            rcp.workflowStage = 'Approved';
+            /* Crediting happens HERE and nowhere else — after manual approval,
+             * exactly once (creditReservation is idempotent per receipt). */
             reservation = creditReservation(db, rcp);
 
-            /* ---- FULLY AUTOMATED APPROVAL WORKFLOW ----
-             * One click on "Approve Reservation" performs every step below with
-             * no further manual action: reservation approval, Official Receipt
-             * generation, Receipt Archive persistence, Reservation & Deposit
-             * report logging and the Official Receipt email. */
+            /* ---- POST-APPROVAL AUTOMATION ----
+             * Official Receipt generation, Receipt Archive persistence,
+             * financial report logging, tenant credit and the Official Receipt
+             * email all follow the single approval action. */
             if (reservation) {
                 reservation.status = 'Approved';
                 reservation.approvalStatus = 'Approved';
@@ -3811,8 +4212,16 @@ app.post('/api/receipts/:id/decision', (req, res) => {
                 approvedBy: who,
                 approvedAt: nowIso,
                 notes: note || ''
-            }, { intro: 'Your reservation has been <b>APPROVED</b> and your payment verified. Your Official Receipt is shown below.' });
+            }, { intro: 'Your payment has been <b>APPROVED</b> by our staff. Your Official Receipt is attached below.' });
 
+            if (officialReceipt) {
+                rcp.officialReceiptId = officialReceipt.id;
+                rcp.orNumber = officialReceipt.orNumber;
+                logApprovedPaymentEverywhere(db, {
+                    officialReceipt,
+                    checkIn: !!(reservation && reservation.boarderId)
+                });
+            }
             if (reservation && officialReceipt) {
                 reservation.orNumber = officialReceipt.orNumber;
                 reservation.officialReceiptId = officialReceipt.id;
@@ -3820,7 +4229,9 @@ app.post('/api/receipts/:id/decision', (req, res) => {
         } else {
             rcp.verificationStatus = 'Rejected';
             rcp.adminStatus = 'Rejected';
+            rcp.workflowStage = 'Rejected';
         }
+
         rcp.reviewedBy = who;
         rcp.reviewedAt = nowIso;
         rcp.adminNote = note || '';
@@ -3887,7 +4298,12 @@ app.post('/api/receipts/:id/reocr', async (req, res) => {
             verificationStatus: target.adminStatus === 'Approved' ? target.verificationStatus : verdict.status,
             verificationReason: verdict.reason
         });
-        if (target.verificationStatus === 'Verified' && !target.credited) creditReservation(fresh, target);
+        /* Re-running OCR never credits and never approves. */
+        if (target.adminStatus !== 'Approved') {
+            target.adminStatus = target.verificationStatus === 'Rejected' ? 'Rejected' : 'Awaiting Review';
+            target.workflowStage = target.verificationStatus === 'Rejected' ? 'Rejected' : 'Pending Staff Approval';
+        }
+
         writeStorageAtomic(fresh);
         res.json({ success: true, receipt: target });
     } catch (e) { res.status(500).json({ error: e.message }); }
