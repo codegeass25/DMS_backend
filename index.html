@@ -8740,12 +8740,24 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
       : 'Reason for rejection (sent to the tenant):', '');
     if (decision === 'reject' && note === null) return;
     try {
-      await jf('/api/receipts/' + id + '/decision', { method:'POST', body: JSON.stringify({ decision, note: note || '' }) });
+      const out = await jf('/api/receipts/' + id + '/decision', { method:'POST', body: JSON.stringify({ decision, note: note || '' }) });
       S.since = null;
       await loadMessages(true);
       await refreshThreads();
       // Keep the rest of the Admin Portal in sync (reservations, billing, archive).
       await pullDatabase();
+      /* The approval is fully automated: the Official Receipt has already been
+       * generated, archived, logged into the financial reports and emailed. */
+      if (out && out.officialReceipt){
+        const or = out.officialReceipt;
+        if (typeof window.showToast === 'function') {
+          window.showToast('Reservation Approved · OR ' + or.orNumber + ' issued, archived, logged and emailed automatically.', 'success');
+        } else {
+          alert('Reservation approved.\nOfficial Receipt ' + or.orNumber +
+                ' was generated, archived, logged in the financial reports and emailed to the tenant.');
+        }
+        window.open('/api/official-receipts/' + encodeURIComponent(or.id) + '/print', '_blank', 'noopener');
+      }
     } catch(e){ alert(e.message); }
   }
 
