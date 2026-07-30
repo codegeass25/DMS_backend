@@ -1291,10 +1291,15 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             /* Build the standard tenant data object straight from a boarder record. */
             tenant(b, extra = {}) {
                 const room = bhmsData.rooms.find(r => r.id == b.roomId);
+                // SINGLE SOURCE OF TRUTH: entire-room occupants never carry a bed
+                // number into any email template.
+                const _isEntire = (typeof window.isEntireRoomRecord === 'function') && window.isEntireRoomRecord(b);
                 return {
                     name: b.name,
                     roomNumber: room ? room.roomName : (b.roomId || ''),
-                    bedNo: b.bedNo,
+                    bedNo: _isEntire ? null : b.bedNo,
+                    occupancyType: _isEntire ? 'entire_room' : (b.occupancyType || 'bed'),
+                    accommodation: _isEntire ? 'ENTIRE ROOM' : (b.bedNo ? ('Bed ' + b.bedNo) : '—'),
                     monthlyRent: b.rentRate || b.monthlyRent || 0,
                     balance: b.balance || 0,
                     dueDate: b.dueDate || '',
@@ -1304,10 +1309,14 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             /* Build the standard reservation data object. */
             reservation(res, extra = {}) {
                 const room = bhmsData.rooms.find(r => r.id == res.roomId);
+                const _isEntire = (res.type === 'room' || res.occupancyType === 'entire_room');
                 return {
                     name: res.name,
                     roomNumber: room ? room.roomName : (res.roomId || ''),
-                    bedNo: res.bedNo,
+                    bedNo: _isEntire ? null : res.bedNo,
+                    occupancyType: _isEntire ? 'entire_room' : (res.occupancyType || 'bed'),
+                    type: res.type,
+                    accommodation: _isEntire ? 'ENTIRE ROOM' : (res.bedNo ? ('Bed ' + res.bedNo) : '—'),
                     date: res.date || res.createdAt || '',
                     expiresOn: res.expDate || res.expiresOn || '',
                     ...extra
@@ -1494,6 +1503,49 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
         window.isEntireRoomOccupied = isEntireRoomOccupied;
         window.logicalOccupantCount = logicalOccupantCount;
 
+        /* ================================================================
+         * SINGLE SOURCE OF TRUTH — ROOM / BED ASSIGNMENT LABEL
+         * ----------------------------------------------------------------
+         * Every module (Boarder Profile, Active Boarders Directory, Dormitory
+         * Map, Reservation Details, Check-in Summary, Billing & Receipts,
+         * Emails, Printable Reports, CSV Exports) MUST use these helpers.
+         * If the record is an Entire Room occupancy the label is always
+         * "ENTIRE ROOM" — never a bed number, never a Bed 1 fallback.
+         * ================================================================ */
+        window.isEntireRoomRecord = function (rec) {
+            if (!rec) return false;
+            if (rec.occupancyType === 'entire_room') return true;
+            if (rec.type === 'room') return true;              // reservation records
+            if (rec.reservationType === 'room') return true;
+            try {
+                const room = (bhmsData.rooms || []).find(r => String(r.id) === String(rec.roomId));
+                if (room && rec.id && String(room.entireRoomBoarderId || '') === String(rec.id)) return true;
+            } catch (_) {}
+            return false;
+        };
+        window.getOccupancyRoomName = function (rec, fallbackName) {
+            if (fallbackName) return fallbackName;
+            try {
+                const room = (bhmsData.rooms || []).find(r => String(r.id) === String(rec && rec.roomId));
+                if (room) return room.roomName || ('Room ' + (room.roomNumber || ''));
+            } catch (_) {}
+            return (rec && (rec.lastRoom || rec.roomName || rec.roomNumber)) || '—';
+        };
+        // Bed cell / column value only.
+        window.getBedLabel = function (rec) {
+            if (window.isEntireRoomRecord(rec)) return 'ENTIRE ROOM';
+            const bn = rec && rec.bedNo;
+            return (bn && bn !== 'Any') ? String(bn) : '—';
+        };
+        // Full "Room 9 - ENTIRE ROOM" / "Room 9 - B1" label.
+        window.getOccupancyLabel = function (rec, fallbackName) {
+            return window.getOccupancyRoomName(rec, fallbackName) + ' - ' + window.getBedLabel(rec);
+        };
+        // Occupancy type normalised for persistence / emails.
+        window.getOccupancyType = function (rec) {
+            return window.isEntireRoomRecord(rec) ? 'entire_room' : ((rec && rec.occupancyType) || 'bed');
+        };
+
 
         function updateRoomStatus(roomId) {
             const room = bhmsData.rooms.find(r => r.id == roomId);
@@ -1547,7 +1599,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
                 rHTML += '<div class="px-3 py-1 text-[10px] font-black text-gray-500 bg-gray-50 uppercase border-b">Active Boarders</div>';
                 matchedB.forEach(b => {
                     const room = bhmsData.rooms.find(r => r.id == b.roomId);
-                    rHTML += `<div onclick="openBoarderProfile('${b.id}'); hideSearch();" class="px-4 py-2 hover:bg-blue-50 cursor-pointer border-b text-sm"><b>${b.name}</b><br><span class="text-xs text-gray-500">${room.roomName} - ${b.bedNo}</span></div>`;
+                    rHTML += `<div onclick="openBoarderProfile('${b.id}'); hideSearch();" class="px-4 py-2 hover:bg-blue-50 cursor-pointer border-b text-sm"><b>${b.name}</b><br><span class="text-xs text-gray-500">${window.getOccupancyLabel(b, room.roomName)}</span></div>`;
                 });
             }
             
@@ -2172,7 +2224,11 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             document.getElementById('ci-room-id').value = roomId;
             document.getElementById('ci-bed-no').value = bedNo;
             document.getElementById('ci-res-id').value = resId || '';
-            document.getElementById('ci-location-display').innerText = `${room.roomName} - Bed ${bedNo}`;
+            const _ciRes = resId ? bhmsData.reservations.find(r => r.id === resId) : null;
+            const _ciEntire = !!(_ciRes && (_ciRes.type === 'room' || _ciRes.occupancyType === 'entire_room'));
+            document.getElementById('ci-location-display').innerText = _ciEntire
+                ? `${room.roomName} - ENTIRE ROOM`
+                : `${room.roomName} - Bed ${bedNo}`;
             
             if(resId) {
                 let res = bhmsData.reservations.find(r => r.id === resId);
@@ -2605,7 +2661,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             document.getElementById('bp-name').innerText = boarder.name;
             document.getElementById('bp-email').innerHTML = `<i class="fa-solid fa-envelope mr-1"></i>${boarder.email}`;
             document.getElementById('bp-contact').innerHTML = `<i class="fa-solid fa-phone mr-1"></i>${boarder.contact}`;
-            document.getElementById('bp-location').innerText = `${room.roomName} - ${boarder.bedNo}`;
+            document.getElementById('bp-location').innerText = window.getOccupancyLabel(boarder, room.roomName);
             
             const payerStatusEl = document.getElementById('bp-payer-status');
             payerStatusEl.style.display = boarder.isPayer ? 'inline-block' : 'none';
@@ -2624,7 +2680,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             const boarder = bhmsData.boarders.find(b => b.id === boarderId);
             const room = bhmsData.rooms.find(r => r.id == boarder.roomId);
             
-            document.getElementById('tf-boarder-id').value = boarder.id; document.getElementById('tf-current-loc').innerText = `${room.roomName} - Bed ${boarder.bedNo}`;
+            document.getElementById('tf-boarder-id').value = boarder.id; document.getElementById('tf-current-loc').innerText = window.getOccupancyLabel(boarder, room.roomName);
             
             const rSelect = document.getElementById('tf-new-room');
             rSelect.innerHTML = '<option value="" disabled selected>Select Room...</option>';
@@ -2727,7 +2783,13 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             
             updateRoomStatus(oldRoom.id); updateRoomStatus(newRoom.id);
             logAudit('Transfer', `Transferred ${boarder.name} to ${newRoom.roomName}-${nBedNo}`, `${oldRoom.roomName}-${oldBed.bedNo}`, `${newRoom.roomName}-${nBedNo}`);
-            EmailService.notify('room-transfer', boarder.email, EmailService.tenant(boarder, { previousRoom: oldRoom.roomName, previousBed: oldBed.bedNo, roomNumber: newRoom.roomName, bedNo: nBedNo, reason, transferDate: new Date().toISOString().split('T')[0] }));
+            EmailService.notify('room-transfer', boarder.email, EmailService.tenant(boarder, {
+                previousRoom: oldRoom.roomName,
+                previousBed: (transferType === 'Entire Room Transfer' ? 'ENTIRE ROOM' : oldBed.bedNo),
+                previousOccupancyType: (transferType === 'Entire Room Transfer' ? 'entire_room' : 'bed'),
+                roomNumber: newRoom.roomName,
+                bedNo: window.isEntireRoomRecord(boarder) ? null : nBedNo,
+                reason, transferDate: new Date().toISOString().split('T')[0] }));
             
             if(fee > 0) printReceipt(tfTx, boarder);
 
@@ -2754,7 +2816,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             }
 
             let inDate = new Date(boarder.moveInDate); let outDate = new Date(); let diffTime = Math.abs(outDate - inDate); let diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-            let former = { ...boarder, checkOutDate: outDate.toISOString().split('T')[0], checkOutDateTime: getFormattedDateTime(outDate), stayDuration: diffDays + ' days', lastRoom: room.roomName };
+            let former = { ...boarder, occupancyType: window.getOccupancyType(boarder), bedNo: window.isEntireRoomRecord(boarder) ? null : boarder.bedNo, checkOutDate: outDate.toISOString().split('T')[0], checkOutDateTime: getFormattedDateTime(outDate), stayDuration: diffDays + ' days', lastRoom: room.roomName };
             bhmsData.formerBoarders.push(former); bhmsData.boarders = bhmsData.boarders.filter(b => b.id !== boarderId);
             
             updateRoomStatus(room.id); logAudit('Checkout', `Checked out ${boarder.name}`, null, null);
@@ -2785,7 +2847,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             if(logs.length === 0) tb.innerHTML = `<tr><td colspan="4" class="p-4 text-center text-gray-500">No reservation logs yet.</td></tr>`;
             logs.forEach(r => {
                 let room = bhmsData.rooms.find(rm => rm.id == r.roomId);
-                let loc = room ? (r.type === 'room' ? `${room.roomName} (All)` : `${room.roomName} - Bed ${r.bedNo}`) : '—';
+                let loc = room ? window.getOccupancyLabel(r, room.roomName) : '—';
                 let badgeClass = r.status === 'Active' ? 'bg-blue-100 text-blue-800'
                               : r.status === 'Cancelled' ? 'bg-red-100 text-red-800'
                               : r.status === 'Completed' ? 'bg-emerald-100 text-emerald-800'
@@ -2990,9 +3052,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             if(!res) return;
             const kind = res.type === 'bed' ? 'Bed Space' : 'Entire Room';
             const room = bhmsData.rooms.find(r => r.id == res.roomId);
-            const loc = res.type === 'room'
-                ? `${room ? room.roomName : res.roomId} (Entire Room)`
-                : `${room ? room.roomName : res.roomId} - Bed ${res.bedNo || ''}`;
+            const loc = window.getOccupancyLabel(res, room ? room.roomName : String(res.roomId));
             document.getElementById('cancelResId').value = id;
             document.getElementById('cancelResSummary').innerHTML =
                 `<b>${res.name}</b> &middot; ${kind}<br><span class="text-gray-600">${loc} &middot; Ref: ${id}</span>`;
@@ -3828,7 +3888,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             });
             list.forEach(b => {
                 const room = bhmsData.rooms.find(r => r.id == b.roomId);
-                tb.innerHTML += `<tr class="hover:bg-blue-50"><td class="p-4"><p class="font-bold text-gray-800">${b.name}</p><p class="text-xs text-gray-500">${b.email}</p></td><td class="p-4 font-bold text-gray-600">${room.roomName} - ${b.bedNo}</td><td class="p-4 text-gray-600 font-medium">${b.contact}</td><td class="p-4 text-gray-600">${b.moveInDate}</td><td class="p-4 text-center"><button onclick="openBoarderProfile('${b.id}')" class="text-sm bg-white border px-4 py-1.5 rounded-lg hover:bg-gray-100 font-bold">Profile</button></td></tr>`;
+                tb.innerHTML += `<tr class="hover:bg-blue-50"><td class="p-4"><p class="font-bold text-gray-800">${b.name}</p><p class="text-xs text-gray-500">${b.email}</p></td><td class="p-4 font-bold text-gray-600">${window.getOccupancyLabel(b, room.roomName)}</td><td class="p-4 text-gray-600 font-medium">${b.contact}</td><td class="p-4 text-gray-600">${b.moveInDate}</td><td class="p-4 text-center"><button onclick="openBoarderProfile('${b.id}')" class="text-sm bg-white border px-4 py-1.5 rounded-lg hover:bg-gray-100 font-bold">Profile</button></td></tr>`;
             });
         }
 
@@ -3843,13 +3903,13 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
                 return tb2 - ta;
             });
             list.forEach(f => {
-                tb.innerHTML += `<tr class="hover:bg-gray-50 text-sm"><td class="p-4"><p class="font-bold text-gray-800">${f.name}</p><p class="text-xs text-gray-500">${f.email}</p></td><td class="p-4 font-bold text-gray-600">${f.lastRoom} - ${f.bedNo}</td><td class="p-4 text-gray-600 font-medium">${f.stayDuration}</td><td class="p-4 text-gray-600">${f.checkOutDate}</td><td class="p-4 text-center"><button onclick="viewFormerBoarder('${f.id}')" class="text-sm bg-gray-100 border px-3 py-1 rounded hover:bg-gray-200 font-bold">View</button></td></tr>`;
+                tb.innerHTML += `<tr class="hover:bg-gray-50 text-sm"><td class="p-4"><p class="font-bold text-gray-800">${f.name}</p><p class="text-xs text-gray-500">${f.email}</p></td><td class="p-4 font-bold text-gray-600">${window.getOccupancyLabel(f, f.lastRoom)}</td><td class="p-4 text-gray-600 font-medium">${f.stayDuration}</td><td class="p-4 text-gray-600">${f.checkOutDate}</td><td class="p-4 text-center"><button onclick="viewFormerBoarder('${f.id}')" class="text-sm bg-gray-100 border px-3 py-1 rounded hover:bg-gray-200 font-bold">View</button></td></tr>`;
             });
         }
         function viewFormerBoarder(id) {
             let fb = bhmsData.formerBoarders.find(f => f.id === id);
             document.getElementById('fb-name').innerText = fb.name; document.getElementById('fb-email-contact').innerText = `${fb.email} | ${fb.contact}`;
-            document.getElementById('fb-room').innerText = `${fb.lastRoom} - ${fb.bedNo}`; document.getElementById('fb-duration').innerText = fb.stayDuration;
+            document.getElementById('fb-room').innerText = window.getOccupancyLabel(fb, fb.lastRoom); document.getElementById('fb-duration').innerText = fb.stayDuration;
             document.getElementById('fb-in').innerText = fb.moveInDate; document.getElementById('fb-out').innerText = fb.checkOutDate;
             document.getElementById('formerBoarderModal').classList.remove('hidden');
         }
@@ -4521,7 +4581,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
                 let list = auditTrailSort(bhmsData.reservations, r => r.completedAt || r.cancelledAt || r.expiredAt || r.createdAt || r.date);
                 list.forEach(r => {
                     let rm = bhmsData.rooms.find(room => room.id == r.roomId);
-                    let loc = r.type === 'room' ? `${rm?.roomName} (Entire Room)` : `${rm?.roomName} - Bed ${r.bedNo}`;
+                    let loc = window.getOccupancyLabel(r, rm?.roomName);
                     let stamp = r.completedAt || r.cancelledAt || r.expiredAt || r.createdAt || r.date;
                     currentReport.rows.push([ stamp || '—', r.name, loc, r.date, r.status ]);
                 });
@@ -4533,7 +4593,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
                     currentReport.rows.push([
                         f.checkOutDateTime || f.checkOutDate,
                         f.name,
-                        `${f.lastRoom} - ${f.bedNo}`,
+                        window.getOccupancyLabel(f, f.lastRoom),
                         f.checkOutDate,
                         f.stayDuration
                     ]);
@@ -4812,7 +4872,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             const headers = ['Name','Email','Contact','Room','Bed','Move-in Date','Monthly Rate','Balance'];
             const rows = list.map(b => {
                 const room = bhmsData.rooms.find(r => r.id == b.roomId);
-                return [b.name, b.email||'', b.contact||'', room?room.roomName:'', b.bedNo||'', b.moveInDate||'', b.rentRate||0, b.balance||0];
+                return [b.name, b.email||'', b.contact||'', room?room.roomName:'', window.getBedLabel(b), b.moveInDate||'', b.rentRate||0, b.balance||0];
             });
             const stamp = new Date().toISOString().slice(0,10);
             mdmsExportCSV(`Active_Boarders_${stamp}.csv`, headers, rows);
@@ -4821,7 +4881,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             const list = _getActiveBoardersSorted();
             const rows = list.length ? list.map(b => {
                 const room = bhmsData.rooms.find(r => r.id == b.roomId);
-                return `<tr><td>${b.name||''}</td><td>${b.email||''}</td><td>${b.contact||''}</td><td>${room?room.roomName:''} - ${b.bedNo||''}</td><td>${b.moveInDate||''}</td><td style="text-align:right;">₱${Number(b.rentRate||0).toLocaleString()}</td><td style="text-align:right;color:${(b.balance||0)>0?'#991b1b':'#065f46'};font-weight:700;">₱${Number(b.balance||0).toLocaleString()}</td></tr>`;
+                return `<tr><td>${b.name||''}</td><td>${b.email||''}</td><td>${b.contact||''}</td><td>${window.getOccupancyLabel(b, room?room.roomName:'')}</td><td>${b.moveInDate||''}</td><td style="text-align:right;">₱${Number(b.rentRate||0).toLocaleString()}</td><td style="text-align:right;color:${(b.balance||0)>0?'#991b1b':'#065f46'};font-weight:700;">₱${Number(b.balance||0).toLocaleString()}</td></tr>`;
             }).join('') : '<tr><td colspan="7" style="text-align:center;padding:20px;color:#64748b;">No active boarders.</td></tr>';
             const tbl = `<table><thead><tr><th>Name</th><th>Email</th><th>Contact</th><th>Room / Bed</th><th>Move-in Date</th><th style="text-align:right;">Monthly Rate</th><th style="text-align:right;">Balance</th></tr></thead><tbody>${rows}</tbody></table>`;
             mdmsOpenPrintPreview('Active Boarder Directory', tbl, { subtitle: `Total active boarders: ${list.length}. Sorted by most recent move-in.` });
@@ -4838,14 +4898,14 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
         function exportFormerBoardersCSV() {
             const list = _getFormerBoardersSorted();
             const headers = ['Name','Email','Contact','Last Room','Bed','Move-in Date','Checkout Date','Stay Duration'];
-            const rows = list.map(f => [f.name,f.email||'',f.contact||'',f.lastRoom||'',f.bedNo||'',f.moveInDate||'',f.checkOutDate||'',f.stayDuration||'']);
+            const rows = list.map(f => [f.name,f.email||'',f.contact||'',f.lastRoom||'',window.getBedLabel(f),f.moveInDate||'',f.checkOutDate||'',f.stayDuration||'']);
             const stamp = new Date().toISOString().slice(0,10);
             mdmsExportCSV(`Former_Boarders_${stamp}.csv`, headers, rows);
         }
         function printFormerBoarders() {
             const list = _getFormerBoardersSorted();
             const rows = list.length ? list.map(f =>
-                `<tr><td>${f.name||''}</td><td>${f.email||''}</td><td>${f.contact||''}</td><td>${f.lastRoom||''} - ${f.bedNo||''}</td><td>${f.moveInDate||''}</td><td>${f.checkOutDate||''}</td><td>${f.stayDuration||''}</td></tr>`
+                `<tr><td>${f.name||''}</td><td>${f.email||''}</td><td>${f.contact||''}</td><td>${window.getOccupancyLabel(f, f.lastRoom||'')}</td><td>${f.moveInDate||''}</td><td>${f.checkOutDate||''}</td><td>${f.stayDuration||''}</td></tr>`
             ).join('') : '<tr><td colspan="7" style="text-align:center;padding:20px;color:#64748b;">No former boarders.</td></tr>';
             const tbl = `<table><thead><tr><th>Name</th><th>Email</th><th>Contact</th><th>Last Room / Bed</th><th>Move-in</th><th>Checkout</th><th>Stay Duration</th></tr></thead><tbody>${rows}</tbody></table>`;
             mdmsOpenPrintPreview('Former Boarders History', tbl, { subtitle: `Total former boarders: ${list.length}. Sorted by most recent checkout.` });
@@ -6630,8 +6690,9 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
     }catch(_){}
     try{
       EmailService.notify('room-transfer', boarder.email, EmailService.tenant(boarder, {
-        previousRoom: oldRoom.roomName, previousBed: oldBedNo,
-        roomNumber: newRoom.roomName, bedNo: nBedNo,
+        previousRoom: oldRoom.roomName, previousBed: 'ENTIRE ROOM',
+        previousOccupancyType: 'entire_room',
+        roomNumber: newRoom.roomName, bedNo: null, occupancyType: 'entire_room',
         reason, transferDate: new Date().toISOString().split('T')[0]
       }));
     }catch(_){}
