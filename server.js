@@ -33,6 +33,10 @@ const PORT = process.env.PORT || 8080;
 // STORAGE: Supabase PostgreSQL (replaces the legacy data.json file store).
 const { loadDatabase, persistDatabase, isConfigured: supabaseConfigured } = require('./supabase');
 
+// OFFICIAL RECEIPT ENGINE — the single source of truth for OR numbering,
+// receipt archiving, financial report logging and receipt emailing.
+const OR = require('./official-receipts');
+
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
@@ -273,7 +277,9 @@ const DEFAULT_WHITE_LABEL = {
     currency: 'PHP',
     businessPermit: '',
     tin: '',
-    qrCode: ''
+    qrCode: '',
+    signatureUrl: ''                     // optional digital signature image
+
 };
 
 /* Currency code -> display symbol. Used by every money value the backend
@@ -318,6 +324,36 @@ const BrandingService = {
     },
     money(brand, n){ return (brand.currencySymbol || '') + Number(n || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
 };
+
+/* Wire the Official Receipt engine to the ONE branding service, the ONE email
+ * pipeline and the ONE audit log. No duplicate systems are created. */
+OR.init({
+    BrandingService,
+    sendEmailWithRetry: (args) => sendEmailWithRetry(args),
+    appendAuditEntry: (mod, action, req) => appendAuditEntry(mod, action, req || null)
+});
+
+/**
+ * AUTOMATIC OFFICIAL RECEIPT PIPELINE (system-wide).
+ * Generates the OR, archives it, logs it into the correct financial report and
+ * emails a copy to the registered customer email — for EVERY payment, whether
+ * it originates from the Tenant Portal or the Admin Office.
+ * Returns the receipt (existing one when the transaction was already receipted).
+ */
+function autoIssueOfficialReceipt(db, payload, options) {
+    const opts = options || {};
+    const { receipt, created } = OR.issueOfficialReceipt(db, payload);
+    if (created && opts.email !== false) {
+        const snapshot = JSON.parse(JSON.stringify(receipt));
+        const intro = opts.intro;
+        setImmediate(async () => {
+            try { await OR.emailOfficialReceipt(readStorage(), snapshot, intro); }
+            catch (e) { console.error('[OFFICIAL-RECEIPT-EMAIL]', e.message); }
+        });
+    }
+    return receipt;
+}
+
 
 /* Branding must exist in exactly one place. Any legacy duplicate copied into
  * settings by older builds is removed on load and on save. */
@@ -2259,6 +2295,86 @@ function validateReservationFeeCredits(existing, merged) {
 }
 
 /* ====================================================================
+ * UNIVERSAL OFFICIAL RECEIPT AUTOMATION
+ * Every money-in transaction anywhere in the system is receipted exactly
+ * once. No manual encoding, no duplicate OR numbers, no missed report entry.
+ * ==================================================================== */
+
+/** Transaction types that represent money actually received. */
+const OR_RECEIPTABLE_TYPES = {
+    'Payment': 'Monthly Rental',
+    'Check-In Payment': 'Check-in Payment',
+    'Check-in Payment': 'Check-in Payment',
+    'Initial Payment': 'Check-in Payment',
+    'Move-In Payment': 'Check-in Payment',
+    'Security Deposit': 'Security Deposit',
+    'Deposit': 'Security Deposit',
+    'Reservation Credit': 'Reservation Fee',
+    'Transfer Fee': 'Transfer Fee',
+    'Penalty': 'Penalty',
+    'Penalty Payment': 'Penalty',
+    'Utility Payment': 'Utilities',
+    'Miscellaneous': 'Miscellaneous',
+    'Other': 'Miscellaneous'
+};
+
+function orPayerFromTransaction(db, tx) {
+    const boarder = (db.boarders || []).find(b => String(b.id) === String(tx.boarderId));
+    const reservation = (db.reservations || []).find(r => String(r.id) === String(tx.reservationId));
+    const person = boarder || reservation || {};
+    const room = (db.rooms || []).find(r => String(r.id) === String(person.roomId));
+    const entire = person.occupancyType === 'entire_room' || person.type === 'room';
+    return {
+        payerName: person.name || tx.payerName || tx.tenantName || '—',
+        payerEmail: person.email || tx.payerEmail || '',
+        payerContact: person.contact || person.contactNumber || '',
+        roomNumber: room ? (room.roomName || ('Room ' + room.roomNumber)) : (person.roomId || '—'),
+        bedNumber: entire ? 'ENTIRE ROOM' : (person.bedNo || '—'),
+        reservationType: entire ? 'Entire Room' : 'Bed Space'
+    };
+}
+
+/**
+ * Sweep freshly synced transactions and issue an Official Receipt for each
+ * money-in record that does not have one yet. Idempotent by transaction id.
+ */
+function autoReceiptPendingTransactions(db, previous, req) {
+    const issued = [];
+    try {
+        const seen = new Set((previous.transactions || []).map(t => String(t.id)));
+        (db.transactions || []).forEach(tx => {
+            if (!tx || tx.officialReceiptId) return;
+            const category = OR_RECEIPTABLE_TYPES[tx.type];
+            if (!category) return;
+            const amount = Number(tx.amount || tx.amountPaid || 0);
+            if (!(amount > 0)) return;
+            // Only receipt transactions newly introduced by this sync; historical
+            // records stay untouched so existing books are never rewritten.
+            if (seen.has(String(tx.id))) return;
+            const receipt = autoIssueOfficialReceipt(db, {
+                category,
+                amount,
+                paymentMethod: tx.paymentMethod || tx.method || 'Cash',
+                paymentReference: tx.reference || tx.paymentReference || '',
+                boarderId: tx.boarderId || null,
+                reservationId: tx.reservationId || null,
+                transactionId: tx.id,
+                ocrStatus: tx.ocrStatus || 'Not Applicable',
+                datePaid: tx.date || new Date().toISOString(),
+                approvedBy: (req && req.mdmsUser && req.mdmsUser.name) || 'Administrator',
+                notes: tx.details || '',
+                ...orPayerFromTransaction(db, tx)
+            });
+            tx.officialReceiptId = receipt.id;
+            tx.orNumber = tx.orNumber || receipt.orNumber;
+            issued.push({ transactionId: tx.id, orNumber: receipt.orNumber });
+        });
+    } catch (e) { console.error('[OR-SWEEP]', e.message); }
+    return issued;
+}
+
+
+/* ====================================================================
  * API ROUTES — all existing routes preserved, plus new ones
  * ==================================================================== */
 app.get('/api/data', (req, res) => {
@@ -2461,8 +2577,18 @@ app.post('/api/data', (req, res) => {
         // FINAL FIX: reconcile entire-room ownership before persisting so a
         // transferred-away room can never be written back as occupied.
         reconcileEntireRoomState(merged);
+
+        /* SYSTEM-WIDE OFFICIAL RECEIPT AUTOMATION.
+         * Any payment transaction created by the Admin Portal (check-in payment,
+         * security deposit, transfer fee, penalty, miscellaneous or walk-in/office
+         * payment) is automatically receipted, archived, logged into the correct
+         * financial report and emailed to the customer. Existing transactions are
+         * never re-receipted — the engine is idempotent per transaction. */
+        const issued = autoReceiptPendingTransactions(merged, existing, req);
+
         writeStorageAtomic(merged);
-        res.status(200).json({ success: true, message: 'Data synced.' });
+        res.status(200).json({ success: true, message: 'Data synced.', officialReceipts: issued });
+
     } catch (e) { res.status(500).json({ error: 'Sync failure.', details: e.message }); }
 });
 
@@ -2604,13 +2730,40 @@ app.post('/api/payment', (req, res) => {
             amount: numericAmount,
             reference: reference || '',
             orNumber: orNumber || '',
+            category: req.body.category || 'Monthly Rental',
+            paymentMethod: req.body.paymentMethod || req.body.method || 'Cash',
             details: `Payment recorded. Ref: ${reference || 'None'}`
         };
         db.transactions.push(tx);
-        appendAuditEntry('Billing Ledger', `Payment ${BrandingService.get(db).currencySymbol}${numericAmount} for ${tenant.name}`, req);
+
+        /* AUTOMATIC OFFICIAL RECEIPT — generated, archived, logged into the
+         * financial reports and emailed to the tenant for every payment. */
+        const _room = (db.rooms || []).find(r => String(r.id) === String(tenant.roomId));
+        const _entire = tenant.occupancyType === 'entire_room';
+        const officialReceipt = autoIssueOfficialReceipt(db, {
+            category: tx.category,
+            amount: numericAmount,
+            paymentMethod: tx.paymentMethod,
+            paymentReference: reference || '',
+            boarderId: tenant.id,
+            transactionId: tx.id,
+            payerName: tenant.name,
+            payerEmail: tenant.email,
+            payerContact: tenant.contact || tenant.contactNumber || '',
+            roomNumber: _room ? (_room.roomName || ('Room ' + _room.roomNumber)) : (tenant.roomId || '—'),
+            bedNumber: _entire ? 'ENTIRE ROOM' : (tenant.bedNo || '—'),
+            ocrStatus: 'Not Applicable',
+            datePaid: tx.date,
+            approvedBy: (req.mdmsUser && req.mdmsUser.name) || 'Administrator'
+        });
+        tx.orNumber = tx.orNumber || officialReceipt.orNumber;
+        tx.officialReceiptId = officialReceipt.id;
+
+        appendAuditEntry('Billing Ledger', `Payment ${BrandingService.get(db).currencySymbol}${numericAmount} for ${tenant.name} — OR ${tx.orNumber}`, req);
         writeStorageAtomic(db);
 
-        // Fire-and-forget receipt email — non-blocking, retry-aware, logged.
+        // Fire-and-forget payment-confirmation email (balance summary). The
+        // Official Receipt itself is emailed by the receipt engine above.
         (async () => {
             try {
                 const freshDb = readStorage();
@@ -2622,7 +2775,8 @@ app.post('/api/payment', (req, res) => {
             } catch (e) { console.error('[RECEIPT] async failure:', e.message); }
         })();
 
-        res.status(200).json({ success: true, transaction: tx });
+        res.status(200).json({ success: true, transaction: tx, officialReceipt });
+
     } catch (e) { res.status(500).json({ error: 'Payment processing failed.', details: e.message }); }
 });
 
@@ -3003,9 +3157,18 @@ function chatThreadView(db, t) {
     const msgs = db.chatMessages.filter(m => String(m.threadId) === String(t.id));
     const last = msgs[msgs.length - 1] || null;
     const res = (db.reservations || []).find(r => String(r.id) === String(t.reservationId)) || {};
+    // Official Receipts already issued for this reservation — surfaced so the
+    // Tenant Portal can show APPROVED / PAID and the OR number in real time.
+    const ors = (db.officialReceipts || [])
+        .filter(r => r.status === 'Issued' && String(r.reservationId) === String(t.reservationId))
+        .map(r => ({ id: r.id, orNumber: r.orNumber, amount: r.amount, category: r.category, dateTime: r.dateTime }));
     return {
         ...t,
         reservationStatus: res.status || t.reservationStatus || 'Pending',
+        paymentStatus: res.paymentVerified ? 'Paid' : (res.paymentStatus || 'Pending Verification'),
+        paymentVerified: !!res.paymentVerified,
+        officialReceipts: ors,
+        orNumber: ors.length ? ors[ors.length - 1].orNumber : (res.orNumber || null),
         reservationCredit: Number(res.reservationCredit || 0),
         lastMessage: last ? { text: last.text, kind: last.kind, at: last.at, role: last.role } : null,
         lastAt: last ? last.at : t.createdAt,
@@ -3015,6 +3178,7 @@ function chatThreadView(db, t) {
         adminOnline: (Date.now() - Number((db.presence || {})['admin:' + t.id] || 0)) < PRESENCE_WINDOW_MS,
         messageCount: msgs.length
     };
+
 }
 
 /* --------------------------------------------------------------------
@@ -3507,7 +3671,76 @@ app.post('/api/chat/message', async (req, res) => {
     } catch (e) { res.status(500).json({ error: 'Message failed.', details: e.message }); }
 });
 
+/* ------------------- OFFICIAL RECEIPTS (OR) API --------------------- */
+
+/** List Official Receipts. Filter by boarder, reservation, category or bucket. */
+app.get('/api/official-receipts', (req, res) => {
+    try {
+        const db = OR.ensure(readStorage());
+        const { boarderId, reservationId, category, bucket, status } = req.query || {};
+        let list = db.officialReceipts.slice();
+        if (boarderId)     list = list.filter(r => String(r.boarderId) === String(boarderId));
+        if (reservationId) list = list.filter(r => String(r.reservationId) === String(reservationId));
+        if (category)      list = list.filter(r => r.category === category);
+        if (bucket)        list = list.filter(r => r.reportBucket === bucket);
+        if (status)        list = list.filter(r => r.status === status);
+        list.sort((a, b) => String(b.dateTime).localeCompare(String(a.dateTime)));
+        res.json(list);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/** Financial report feed — every OR grouped into its report bucket. */
+app.get('/api/official-receipts/reports', (req, res) => {
+    try {
+        const db = OR.ensure(readStorage());
+        const buckets = {};
+        db.officialReceipts.filter(r => r.status === 'Issued').forEach(r => {
+            const k = r.reportBucket || 'Miscellaneous Report';
+            buckets[k] = buckets[k] || { bucket: k, count: 0, total: 0, entries: [] };
+            buckets[k].count++;
+            buckets[k].total += Number(r.amount || 0);
+            buckets[k].entries.push(r);
+        });
+        res.json({ buckets: Object.values(buckets), grandTotal: Object.values(buckets).reduce((s, b) => s + b.total, 0) });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/** Printable / downloadable Official Receipt document. */
+app.get('/api/official-receipts/:id/print', (req, res) => {
+    try {
+        const db = OR.ensure(readStorage());
+        const r = db.officialReceipts.find(x => String(x.id) === String(req.params.id) || String(x.orNumber) === String(req.params.id));
+        if (!r) return res.status(404).send('Official Receipt not found.');
+        res.set('Content-Type', 'text/html; charset=utf-8').send(OR.renderPrintableDocument(r));
+    } catch (e) { res.status(500).send(e.message); }
+});
+
+/** Re-send an Official Receipt by email. */
+app.post('/api/official-receipts/:id/email', async (req, res) => {
+    try {
+        const db = OR.ensure(readStorage());
+        const r = db.officialReceipts.find(x => String(x.id) === String(req.params.id) || String(x.orNumber) === String(req.params.id));
+        if (!r) return res.status(404).json({ error: 'Official Receipt not found.' });
+        const out = await OR.emailOfficialReceipt(db, r, 'A copy of your Official Receipt is shown below.');
+        res.json({ success: !!(out && out.success !== false), result: out });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/** Void an Official Receipt (audited; the OR number is never reused). */
+app.post('/api/official-receipts/:id/void', (req, res) => {
+    try {
+        const db = OR.ensure(readStorage());
+        const who = (req.mdmsUser && req.mdmsUser.name) || 'Administrator';
+        const r = OR.voidOfficialReceipt(db, req.params.id, (req.body && req.body.reason) || '', who);
+        if (!r) return res.status(404).json({ error: 'Official Receipt not found.' });
+        appendAuditEntry('Official Receipts', 'Voided ' + r.orNumber + ' by ' + who, req);
+        writeStorageAtomic(db);
+        res.json({ success: true, receipt: r });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 /* ---------------------- RECEIPT ARCHIVE / REVIEW -------------------- */
+
 
 app.get('/api/receipts', (req, res) => {
     try {
@@ -3531,17 +3764,65 @@ app.post('/api/receipts/:id/decision', (req, res) => {
         if (!['approve', 'reject'].includes(decision)) return res.status(400).json({ error: 'decision must be approve or reject.' });
 
         const who = (req.mdmsUser && req.mdmsUser.name) || 'Administrator';
+        const nowIso = new Date().toISOString();
+        let officialReceipt = null;
+        let reservation = null;
+
         if (decision === 'approve') {
             if (amount != null && Number(amount) > 0) rcp.amount = Number(amount);
             rcp.verificationStatus = 'Verified';
             rcp.adminStatus = 'Approved';
-            creditReservation(db, rcp);
+            reservation = creditReservation(db, rcp);
+
+            /* ---- FULLY AUTOMATED APPROVAL WORKFLOW ----
+             * One click on "Approve Reservation" performs every step below with
+             * no further manual action: reservation approval, Official Receipt
+             * generation, Receipt Archive persistence, Reservation & Deposit
+             * report logging and the Official Receipt email. */
+            if (reservation) {
+                reservation.status = 'Approved';
+                reservation.approvalStatus = 'Approved';
+                reservation.paymentStatus = 'Paid';
+                reservation.paymentVerified = true;
+                reservation.ocrStatus = rcp.verificationStatus;
+                reservation.approvedBy = who;
+                reservation.approvedAt = nowIso;
+                reservation.lastStatusChangeAt = nowIso;
+            }
+
+            const room = (db.rooms || []).find(r => reservation && String(r.id) === String(reservation.roomId));
+            const isEntire = !!(reservation && (reservation.occupancyType === 'entire_room' || reservation.type === 'room'));
+            officialReceipt = autoIssueOfficialReceipt(db, {
+                category: 'Reservation Fee',
+                amount: Number(rcp.amount || 0),
+                paymentMethod: rcp.paymentMethod || 'GCash',
+                paymentReference: rcp.referenceNumber || '',
+                reservationId: rcp.reservationId || (reservation && reservation.id) || null,
+                boarderId: (reservation && reservation.boarderId) || null,
+                receiptId: rcp.id,
+                payerName: rcp.tenantName || (reservation && reservation.name) || '—',
+                payerEmail: rcp.tenantEmail || (reservation && reservation.email) || '',
+                payerContact: (reservation && (reservation.contact || reservation.contactNumber)) || '',
+                roomNumber: room ? (room.roomName || ('Room ' + room.roomNumber)) : (reservation && reservation.roomId) || '—',
+                bedNumber: isEntire ? 'ENTIRE ROOM' : ((reservation && reservation.bedNo) || '—'),
+                reservationType: isEntire ? 'Entire Room' : 'Bed Space',
+                ocrStatus: rcp.verificationStatus,
+                datePaid: rcp.paymentDate || rcp.uploadDate || nowIso,
+                approvedBy: who,
+                approvedAt: nowIso,
+                notes: note || ''
+            }, { intro: 'Your reservation has been <b>APPROVED</b> and your payment verified. Your Official Receipt is shown below.' });
+
+            if (reservation && officialReceipt) {
+                reservation.orNumber = officialReceipt.orNumber;
+                reservation.officialReceiptId = officialReceipt.id;
+            }
         } else {
             rcp.verificationStatus = 'Rejected';
             rcp.adminStatus = 'Rejected';
         }
         rcp.reviewedBy = who;
-        rcp.reviewedAt = new Date().toISOString();
+        rcp.reviewedAt = nowIso;
         rcp.adminNote = note || '';
 
         const brand = BrandingService.get(db);
@@ -3549,9 +3830,12 @@ app.post('/api/receipts/:id/decision', (req, res) => {
             id: 'MSG-' + Date.now() + 'D', threadId: rcp.threadId, role: 'system', kind: 'ocr',
             receiptId: rcp.id,
             text: decision === 'approve'
-                ? 'Administrator approved your receipt. ' + BrandingService.money(brand, rcp.amount) + ' credited to reservation ' + rcp.reservationId + '.' + (note ? ' Note: ' + note : '')
+                ? 'Administrator approved your reservation. ' + BrandingService.money(brand, rcp.amount) +
+                  ' credited to reservation ' + rcp.reservationId + '.' +
+                  (officialReceipt ? ' Official Receipt ' + officialReceipt.orNumber + ' has been issued and emailed to you.' : '') +
+                  (note ? ' Note: ' + note : '')
                 : 'Administrator rejected your receipt.' + (note ? ' Reason: ' + note : ''),
-            at: new Date().toISOString(), delivered: true, readByAdmin: true, readByTenant: false
+            at: nowIso, delivered: true, readByAdmin: true, readByTenant: false
         });
         appendAuditEntry('Receipt Archive', 'Receipt ' + rcp.id + ' ' + decision + 'd by ' + who, req);
         writeStorageAtomic(db);
@@ -3563,16 +3847,19 @@ app.post('/api/receipts/:id/decision', (req, res) => {
                 if (cfg && cfg.enabled && rcp.tenantEmail) {
                     await sendEmailWithRetry({
                         to: rcp.tenantEmail,
-                        subject: '[' + brand.systemShortName + '] Receipt ' + (decision === 'approve' ? 'Approved' : 'Rejected'),
+                        subject: '[' + brand.systemShortName + '] Reservation ' + (decision === 'approve' ? 'Approved' : 'Receipt Rejected'),
                         html: '<p>Hello ' + rcp.tenantName + ',</p><p>Your receipt for reservation ' + rcp.reservationId +
-                              ' was ' + (decision === 'approve' ? 'approved' : 'rejected') + '.' + (note ? ' Note: ' + note : '') + '</p><p>' + brand.emailSignature + '</p>',
+                              ' was ' + (decision === 'approve' ? 'approved' : 'rejected') + '.' + (note ? ' Note: ' + note : '') + '</p>' +
+                              (officialReceipt ? '<p>Official Receipt No.: <b>' + officialReceipt.orNumber + '</b> (sent in a separate email).</p>' : '') +
+                              '<p>' + brand.emailSignature + '</p>',
                         type: 'Receipt Decision', config: cfg, settings: d2.settings
                     });
                 }
             } catch (e) { console.error('[RECEIPT-DECISION-EMAIL]', e.message); }
         })();
 
-        res.json({ success: true, receipt: rcp });
+        res.json({ success: true, receipt: rcp, officialReceipt, reservation });
+
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
