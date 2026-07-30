@@ -3018,81 +3018,179 @@ function chatThreadView(db, t) {
 }
 
 /* --------------------------------------------------------------------
- * OCR ENGINE
- * Uses an AI vision model through an OpenAI-compatible endpoint when a
- * key is configured; otherwise every receipt falls back to
- * "Manual Verification Required" (never auto-approved).
+ * OCR ENGINE — OCR.Space (SINGLE PROVIDER)
+ * OCR.Space is the ONLY OCR provider used by this system. There is no
+ * fallback provider and no AI-gateway OCR. When OCR.Space fails, the
+ * receipt falls back to "Manual Verification Required" (never approved).
  * ------------------------------------------------------------------ */
-const OCR_ENDPOINT = process.env.OCR_API_URL || 'https://ai.gateway.lovable.dev/v1/chat/completions';
-const OCR_MODEL    = process.env.OCR_MODEL   || 'google/gemini-3.6-flash';
+const OCRSPACE_ENDPOINT = process.env.OCRSPACE_API_URL || 'https://api.ocr.space/parse/image';
+const OCRSPACE_API_KEY  = process.env.OCRSPACE_API_KEY || 'K85038857488957';
+const OCRSPACE_ENGINE   = process.env.OCRSPACE_ENGINE  || '2';
+const OCR_ENGINE_NAME   = 'ocr.space';
 
-function ocrKey() {
-    return process.env.LOVABLE_API_KEY || process.env.OCR_API_KEY || process.env.OPENAI_API_KEY || '';
+/** Extract structured GCash / e-wallet receipt fields from raw OCR text. */
+function parseReceiptText(text) {
+    const raw   = String(text || '');
+    const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    const flat  = lines.join(' \n ');
+
+    const pick = (re) => { const m = flat.match(re); return m ? (m[1] || '').trim() : ''; };
+
+    // Reference number: labelled first, then any long digit/alnum run.
+    let referenceNumber = pick(/(?:ref(?:erence)?(?:\s*(?:no|number|#))?)\s*[:.#-]?\s*([A-Z0-9][A-Z0-9 -]{5,})/i)
+        .replace(/\s+/g, '');
+    if (!referenceNumber) {
+        const m = raw.match(/\b(\d{9,})\b/);
+        referenceNumber = m ? m[1] : '';
+    }
+
+    // Amount: labelled amount / total, else the largest currency-looking number.
+    let amount = 0;
+    const amtLabelled = pick(/(?:amount|total|amount sent|amount paid)\s*[:]?\s*(?:php|p|₱)?\s*([0-9][0-9,]*\.?[0-9]{0,2})/i);
+    if (amtLabelled) amount = parseFloat(amtLabelled.replace(/,/g, '')) || 0;
+    if (!amount) {
+        const all = raw.match(/(?:php|₱|P)\s?([0-9][0-9,]*\.[0-9]{2})/gi) || [];
+        const nums = all.map(x => parseFloat(x.replace(/[^0-9.]/g, ''))).filter(n => n > 0);
+        if (nums.length) amount = Math.max.apply(null, nums);
+    }
+
+    // Date: several common receipt formats normalised to YYYY-MM-DD.
+    const MONTHS = { jan:1,feb:2,mar:3,apr:4,may:5,jun:6,jul:7,aug:8,sep:9,oct:10,nov:11,dec:12 };
+    const pad = n => String(n).padStart(2, '0');
+    let date = '';
+    let m = raw.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
+    if (m) date = m[1] + '-' + m[2] + '-' + m[3];
+    if (!date) {
+        m = raw.match(/\b([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s*(\d{4})/);
+        if (m) {
+            const mo = MONTHS[m[1].slice(0, 3).toLowerCase()];
+            if (mo) date = m[3] + '-' + pad(mo) + '-' + pad(m[2]);
+        }
+    }
+    if (!date) {
+        m = raw.match(/\b(\d{1,2})[\/](\d{1,2})[\/](\d{4})\b/);
+        if (m) date = m[3] + '-' + pad(m[1]) + '-' + pad(m[2]);
+    }
+
+    // Time: HH:MM (24h or with AM/PM).
+    let time = '';
+    m = raw.match(/(\d{1,2}):(\d{2})\s*(AM|PM)?/i);
+    if (m) {
+        let h = parseInt(m[1], 10);
+        const ap = (m[3] || '').toUpperCase();
+        if (ap === 'PM' && h < 12) h += 12;
+        if (ap === 'AM' && h === 12) h = 0;
+        time = pad(h) + ':' + m[2];
+    }
+
+    // Names are read line-by-line so a label never swallows the next line.
+    const pickLine = (re) => {
+        for (const l of lines) {
+            const mm = l.match(re);
+            if (mm && mm[1]) return mm[1].replace(/\s{2,}/g, ' ').trim();
+        }
+        return '';
+    };
+    const NAME = '([A-Za-z][A-Za-z.\\-\' *]{2,40})';
+    const senderName   = pickLine(new RegExp('(?:sender|sent by|from|account name)\\s*[:]?\\s*' + NAME + '$', 'i'));
+    const receiverName = pickLine(new RegExp('(?:receiver|received by|sent to|recipient)\\s*[:]?\\s*' + NAME + '$', 'i'));
+
+    return {
+        fields: {
+            referenceNumber,
+            senderName,
+            receiverName,
+            amount,
+            date,
+            time
+        },
+        textLength: raw.replace(/\s/g, '').length
+    };
 }
 
+/**
+ * Run OCR on a receipt image using OCR.Space only.
+ * `dataUrl` is a base64 data URL (data:image/png;base64,....).
+ * Never throws — always resolves to a result object.
+ */
 async function runReceiptOcr(dataUrl) {
-    const key = ocrKey();
-    if (!key) {
-        return { ok: false, confidence: 0, readable: false, engine: 'none',
-                 error: 'No OCR key configured (LOVABLE_API_KEY / OCR_API_KEY).', fields: {} };
-    }
-    const headers = { 'Content-Type': 'application/json' };
-    if (process.env.LOVABLE_API_KEY && !process.env.OCR_API_KEY && !process.env.OPENAI_API_KEY) {
-        headers['Lovable-API-Key'] = key;
-    } else {
-        headers['Authorization'] = 'Bearer ' + key;
-    }
-    const prompt =
-        'You are an OCR engine for GCash / e-wallet payment receipts. Read the image and return ONLY minified JSON ' +
-        'with these keys: referenceNumber, senderName, receiverName, amount (number, no symbols), date (YYYY-MM-DD), ' +
-        'time (HH:MM), readable (boolean - is the image legible), authentic (boolean - does it look like a genuine ' +
-        'unedited payment receipt), confidence (0..1 how certain you are of ALL extracted fields), notes (short string). ' +
-        'Use empty string for anything you cannot read. Never invent values.';
+    const fail = (error) => ({ ok: false, confidence: 0, readable: false, engine: OCR_ENGINE_NAME, error, fields: {} });
+
+    if (!OCRSPACE_API_KEY) return fail('OCR is not configured. Set OCRSPACE_API_KEY on the server.');
+    if (!dataUrl || !/^data:image\//i.test(String(dataUrl))) return fail('No readable image was attached to this receipt.');
+
     try {
-        const r = await fetch(OCR_ENDPOINT, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify({
-                model: OCR_MODEL,
-                messages: [{
-                    role: 'user',
-                    content: [
-                        { type: 'text', text: prompt },
-                        { type: 'image_url', image_url: { url: dataUrl } }
-                    ]
-                }]
-            })
-        });
-        const j = await r.json().catch(() => ({}));
-        if (!r.ok) {
-            return { ok: false, confidence: 0, readable: false, engine: OCR_MODEL,
-                     error: (j.error && (j.error.message || j.error)) || ('OCR HTTP ' + r.status), fields: {} };
+        const body = new URLSearchParams();
+        body.set('apikey', OCRSPACE_API_KEY);
+        body.set('base64Image', String(dataUrl));
+        body.set('language', 'eng');
+        body.set('isOverlayRequired', 'false');
+        body.set('scale', 'true');
+        body.set('detectOrientation', 'true');
+        body.set('OCREngine', OCRSPACE_ENGINE);
+
+        const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+        const timer = controller ? setTimeout(() => controller.abort(), 45000) : null;
+
+        let r;
+        try {
+            r = await fetch(OCRSPACE_ENDPOINT, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: body.toString(),
+                signal: controller ? controller.signal : undefined
+            });
+        } finally { if (timer) clearTimeout(timer); }
+
+        const text = await r.text();
+        let j = {};
+        try { j = JSON.parse(text); } catch (_) {
+            return fail('OCR.Space returned an unreadable response (HTTP ' + r.status + ').');
         }
-        const txt = ((j.choices || [])[0] || {}).message || {};
-        let raw = typeof txt.content === 'string' ? txt.content
-                : Array.isArray(txt.content) ? txt.content.map(p => p.text || '').join('') : '';
-        const match = raw.match(/\{[\s\S]*\}/);
-        const parsed = match ? JSON.parse(match[0]) : {};
-        const amount = parseFloat(String(parsed.amount || '').toString().replace(/[^0-9.]/g, '')) || 0;
+        if (!r.ok) return fail('OCR.Space HTTP ' + r.status + ': ' + (j.ErrorMessage || text.slice(0, 200)));
+
+        if (j.IsErroredOnProcessing) {
+            const em = Array.isArray(j.ErrorMessage) ? j.ErrorMessage.join(' ') : (j.ErrorMessage || j.ErrorDetails || 'OCR.Space could not process this image.');
+            return fail(String(em));
+        }
+
+        const results = Array.isArray(j.ParsedResults) ? j.ParsedResults : [];
+        if (!results.length) return fail('OCR.Space returned no text for this image.');
+
+        const first = results[0] || {};
+        if (Number(first.FileParseExitCode) !== 1 && !first.ParsedText) {
+            return fail(first.ErrorMessage || 'OCR.Space could not read this image.');
+        }
+
+        const rawText = results.map(x => x.ParsedText || '').join('\n').trim();
+        const parsed  = parseReceiptText(rawText);
+        const f       = parsed.fields;
+
+        // Confidence is derived from how many key fields were recovered.
+        let score = 0;
+        if (f.referenceNumber) score += 0.40;
+        if (f.amount > 0)      score += 0.30;
+        if (f.date)            score += 0.15;
+        if (f.senderName || f.receiverName) score += 0.10;
+        if (parsed.textLength > 60) score += 0.05;
+        const confidence = Math.max(0, Math.min(1, score));
+        const readable   = parsed.textLength >= 20;
+
         return {
             ok: true,
-            engine: OCR_MODEL,
-            confidence: Math.max(0, Math.min(1, Number(parsed.confidence) || 0)),
-            readable: parsed.readable !== false,
-            authentic: parsed.authentic !== false,
-            notes: parsed.notes || '',
-            fields: {
-                referenceNumber: String(parsed.referenceNumber || '').trim(),
-                senderName: String(parsed.senderName || '').trim(),
-                receiverName: String(parsed.receiverName || '').trim(),
-                amount,
-                date: String(parsed.date || '').trim(),
-                time: String(parsed.time || '').trim()
-            },
-            rawText: raw.slice(0, 4000)
+            engine: OCR_ENGINE_NAME,
+            confidence,
+            readable,
+            authentic: true,           // OCR.Space is text extraction only; forgery review stays manual.
+            notes: readable ? '' : 'Very little text was detected in the uploaded image.',
+            fields: f,
+            rawText: rawText.slice(0, 4000)
         };
     } catch (e) {
-        return { ok: false, confidence: 0, readable: false, engine: OCR_MODEL, error: e.message, fields: {} };
+        const msg = (e && e.name === 'AbortError')
+            ? 'OCR.Space timed out. Please try uploading the receipt again.'
+            : ('OCR.Space request failed: ' + ((e && e.message) || 'unknown error'));
+        return fail(msg);
     }
 }
 
