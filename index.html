@@ -8522,5 +8522,300 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
 </script>
 
 
+<!-- ================================================================
+     ADMIN CHAT NOTIFICATION PANEL — Messenger between Administrators
+     and Tenants. Extends the existing Admin Portal: branding comes from
+     window.Branding (SSOT), data from the same /api/chat/* + /api/receipts
+     endpoints the Tenant Portal uses, and receipt decisions write to the
+     existing Receipt Archive / Reservations / Billing records.
+     ================================================================ -->
+<style>
+  #adm-chat-fab{ position:fixed; right:22px; bottom:22px; z-index:9990; width:58px; height:58px; border-radius:50%; border:none; cursor:pointer;
+    background:var(--wl-primary,#1d4ed8); color:#fff; font-size:1.3rem; box-shadow:0 18px 42px -14px rgba(0,0,0,.55); display:grid; place-items:center; }
+  #adm-chat-fab .b{ position:absolute; top:-4px; right:-4px; min-width:22px; height:22px; padding:0 6px; border-radius:11px; background:#ef4444; color:#fff; font-size:.68rem; font-weight:800; display:none; place-items:center; }
+  #adm-chat{ position:fixed; right:22px; bottom:22px; z-index:9991; width:min(96vw,820px); height:min(84vh,660px); background:#fff; border-radius:18px; overflow:hidden;
+    box-shadow:0 34px 90px -24px rgba(0,0,0,.55); display:none; grid-template-columns:290px 1fr; }
+  #adm-chat.open{ display:grid; }
+  @media (max-width:760px){ #adm-chat{ grid-template-columns:1fr; } #adm-chat.open #adm-chat-list{ display:none; } #adm-chat.open.list #adm-chat-list{ display:flex; } #adm-chat.open.list #adm-chat-main{ display:none; } }
+  #adm-chat-list{ border-right:1px solid #e2e8f0; display:flex; flex-direction:column; background:#f8fafc; }
+  #adm-chat-list header{ padding:.85rem; border-bottom:1px solid #e2e8f0; background:var(--wl-secondary,#0f172a); color:#fff; }
+  #adm-chat-threads{ flex:1; overflow-y:auto; }
+  .act{ padding:.7rem .85rem; border-bottom:1px solid #eef2f7; cursor:pointer; display:flex; gap:.6rem; align-items:flex-start; }
+  .act:hover{ background:#eef2ff; }
+  .act.sel{ background:#e0e7ff; }
+  .act .av{ width:34px; height:34px; border-radius:50%; flex:none; }
+  .act .nm{ font-weight:800; font-size:.8rem; color:#0f172a; }
+  .act .pv{ font-size:.7rem; color:#64748b; margin-top:.15rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:170px; }
+  .act .un{ margin-left:auto; background:#ef4444; color:#fff; font-size:.62rem; font-weight:800; border-radius:10px; padding:.1rem .4rem; }
+  #adm-chat-main{ display:flex; flex-direction:column; min-width:0; }
+  #adm-chat-head{ padding:.75rem 1rem; border-bottom:1px solid #e2e8f0; display:flex; align-items:center; gap:.6rem; }
+  #adm-chat-body{ flex:1; overflow-y:auto; padding:1rem; background:#f8fafc; display:flex; flex-direction:column; gap:.55rem; }
+  .amsg{ max-width:78%; padding:.55rem .8rem; border-radius:14px; font-size:.82rem; line-height:1.45; white-space:pre-wrap; word-break:break-word; }
+  .amsg.me{ align-self:flex-end; background:var(--wl-primary,#1d4ed8); color:#fff; border-bottom-right-radius:4px; }
+  .amsg.them{ align-self:flex-start; background:#fff; border:1px solid #e2e8f0; border-bottom-left-radius:4px; }
+  .amsg.sys{ align-self:center; background:#fef3c7; border:1px solid #fde68a; color:#92400e; font-size:.74rem; text-align:center; max-width:92%; }
+  .amsg.sys.ok{ background:#dcfce7; border-color:#bbf7d0; color:#166534; }
+  .amsg.sys.bad{ background:#fee2e2; border-color:#fecaca; color:#991b1b; }
+  .amsg img{ max-width:100%; border-radius:10px; margin-top:.35rem; cursor:zoom-in; display:block; }
+  .amsg .mt{ font-size:.62rem; opacity:.65; margin-top:.25rem; }
+  .rcpt{ align-self:flex-start; max-width:92%; background:#fff; border:1px solid #e2e8f0; border-radius:14px; padding:.75rem; font-size:.75rem; }
+  .rcpt table{ width:100%; margin:.4rem 0; }
+  .rcpt td{ padding:.12rem .3rem; border-bottom:1px dashed #eef2f7; }
+  .rcpt td:first-child{ color:#64748b; white-space:nowrap; }
+  .rcpt .st{ font-weight:800; padding:.15rem .5rem; border-radius:8px; font-size:.66rem; }
+  #adm-chat-foot{ border-top:1px solid #e2e8f0; padding:.6rem; display:flex; gap:.5rem; align-items:flex-end; }
+  #adm-chat-lb{ position:fixed; inset:0; background:rgba(15,23,42,.9); z-index:20002; display:none; place-items:center; padding:2rem; }
+  #adm-chat-lb.open{ display:grid; }
+  #adm-chat-lb img{ max-width:100%; max-height:100%; border-radius:12px; }
+</style>
+
+<button id="adm-chat-fab" title="Tenant Messages"><i class="fa-solid fa-comments"></i><span class="b" id="adm-chat-badge">0</span></button>
+<div id="adm-chat">
+  <aside id="adm-chat-list">
+    <header>
+      <div class="flex items-center justify-between">
+        <div class="font-black text-sm"><i class="fa-solid fa-comments mr-2"></i>Tenant Messages</div>
+        <button id="adm-chat-x2" class="text-slate-300 hover:text-white text-sm"><i class="fa-solid fa-xmark"></i></button>
+      </div>
+      <input id="adm-chat-search" placeholder="Search conversations…" class="mt-2 w-full text-xs px-2.5 py-1.5 rounded-lg text-slate-800 focus:outline-none">
+      <div id="adm-chat-stats" class="text-[10px] text-slate-300 mt-2"></div>
+    </header>
+    <div id="adm-chat-threads"></div>
+  </aside>
+  <section id="adm-chat-main">
+    <div id="adm-chat-head">
+      <button id="adm-chat-back" class="md:hidden text-slate-500 px-1"><i class="fa-solid fa-chevron-left"></i></button>
+      <img id="adm-chat-av" class="w-9 h-9 rounded-full" alt="">
+      <div class="min-w-0 flex-1">
+        <div id="adm-chat-name" class="font-black text-sm text-slate-900 truncate">Select a conversation</div>
+        <div id="adm-chat-meta" class="text-[11px] text-slate-500 truncate"></div>
+      </div>
+      <button id="adm-chat-x" class="text-slate-400 hover:text-slate-700 px-2"><i class="fa-solid fa-xmark"></i></button>
+    </div>
+    <div id="adm-chat-body"><div class="m-auto text-slate-400 text-sm">No conversation selected.</div></div>
+    <div id="adm-chat-foot">
+      <label class="cursor-pointer px-2.5 py-2 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50" title="Attach image">
+        <i class="fa-solid fa-paperclip"></i><input id="adm-chat-file" type="file" accept="image/*" class="hidden">
+      </label>
+      <textarea id="adm-chat-input" rows="1" placeholder="Reply to the tenant…" class="flex-1 resize-none text-sm px-3 py-2 rounded-lg border border-slate-200 focus:outline-none"></textarea>
+      <button id="adm-chat-send" class="text-white px-3 py-2 rounded-lg" style="background:var(--wl-primary,#1d4ed8)"><i class="fa-solid fa-paper-plane"></i></button>
+    </div>
+  </section>
+</div>
+<div id="adm-chat-lb"><img alt="Receipt"></div>
+
+<script>
+/* =====================================================================
+ * ADMIN MESSENGER MODULE
+ * Reuses: window.Branding (branding SSOT), the existing /api endpoints,
+ * the Receipt Archive, Reservations, Billing and Audit Log records.
+ * Realtime: delta polling (?since=), identical mechanism to the portals.
+ * ===================================================================== */
+(function(){
+  const POLL_MS = 4000;
+  const el = id => document.getElementById(id);
+  const S = { threads:[], sel:null, since:null, open:false, unread:0, q:'' };
+  const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const fmt = iso => { try { return new Date(iso).toLocaleString([], {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'}); } catch(_) { return ''; } };
+  const money = n => (window.Branding && Branding.money) ? Branding.money(n) : ('' + n);
+  const avatar = n => (window.wlAvatar ? window.wlAvatar(n) : '');
+
+  async function jf(path, opts){
+    const r = await fetch(path, Object.assign({ headers: { 'Content-Type':'application/json' }, cache:'no-store' }, opts || {}));
+    const b = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(b.error || ('Request failed (' + r.status + ')'));
+    return b;
+  }
+
+  function statusChip(st){
+    const map = { 'Verified':'background:#dcfce7;color:#166534', 'Rejected':'background:#fee2e2;color:#991b1b',
+                  'Manual Verification Required':'background:#fef3c7;color:#92400e' };
+    return '<span class="st" style="' + (map[st] || 'background:#e2e8f0;color:#334155') + '">' + esc(st) + '</span>';
+  }
+
+  function receiptCard(r){
+    const f = (r.ocr && r.ocr.fields) || {};
+    const pending = r.adminStatus === 'Awaiting Review';
+    return '<div class="rcpt" data-rcpt="' + esc(r.id) + '">' +
+      '<div class="flex items-center gap-2"><b>GCash Receipt</b>' + statusChip(r.verificationStatus) +
+        '<span class="ml-auto text-[10px] text-slate-400">OCR ' + Math.round((r.confidence || 0) * 100) + '%</span></div>' +
+      '<img src="' + esc(r.imagePath) + '" alt="receipt" style="max-height:200px;margin-top:.45rem" class="rcpt-img">' +
+      '<table><tbody>' +
+        '<tr><td>Reference</td><td><b>' + esc(r.referenceNumber || '—') + '</b></td></tr>' +
+        '<tr><td>Sender</td><td>' + esc(r.senderName || '—') + '</td></tr>' +
+        '<tr><td>Receiver</td><td>' + esc(r.receiverName || '—') + '</td></tr>' +
+        '<tr><td>Amount</td><td><b>' + money(r.amount || 0) + '</b></td></tr>' +
+        '<tr><td>Date / Time</td><td>' + esc((r.paymentDate || '—') + ' ' + (r.paymentTime || '')) + '</td></tr>' +
+        '<tr><td>Reservation</td><td>' + esc(r.reservationId) + '</td></tr>' +
+        '<tr><td>Credit</td><td>' + (r.credited ? money(r.creditAmount) + ' credited' : 'Not credited') + '</td></tr>' +
+      '</tbody></table>' +
+      '<div class="text-[11px] text-slate-500">' + esc(r.verificationReason || '') + '</div>' +
+      (pending
+        ? '<div class="flex gap-2 mt-2"><button class="rc-ok px-2.5 py-1 rounded-lg text-white text-[11px] font-bold" style="background:#16a34a">Approve &amp; Credit</button>' +
+          '<button class="rc-no px-2.5 py-1 rounded-lg text-white text-[11px] font-bold" style="background:#dc2626">Reject</button>' +
+          '<button class="rc-re px-2.5 py-1 rounded-lg text-[11px] font-bold border border-slate-300">Re-run OCR</button></div>'
+        : '<div class="text-[11px] mt-1 text-slate-500">' + esc(r.adminStatus) + (r.reviewedBy ? ' by ' + esc(r.reviewedBy) : '') + '</div>') +
+      '</div>';
+  }
+
+  function bubble(m, receipts){
+    if (m.kind === 'ocr' || m.role === 'system'){
+      const ok = /verified|approved|credited/i.test(m.text), bad = /rejected|duplicate/i.test(m.text);
+      return '<div class="amsg sys' + (ok ? ' ok' : bad ? ' bad' : '') + '">' + esc(m.text) + '</div>';
+    }
+    const rcp = m.kind === 'receipt' ? (receipts || []).find(r => String(r.messageId) === String(m.id)) : null;
+    let html = '<div class="amsg ' + (m.role === 'admin' ? 'me' : 'them') + '">' + esc(m.text || '');
+    if (m.attachment && m.attachment.path && !rcp) html += '<img class="lb" src="' + esc(m.attachment.path) + '" alt="attachment">';
+    html += '<div class="mt">' + esc(m.sender || m.role) + ' · ' + fmt(m.at) +
+            (m.role === 'admin' ? (m.readByTenant ? ' · Read' : ' · Delivered') : '') + '</div></div>';
+    return html + (rcp ? receiptCard(rcp) : '');
+  }
+
+  function renderThreads(){
+    const box = el('adm-chat-threads');
+    if (!S.threads.length){ box.innerHTML = '<div class="p-6 text-center text-xs text-slate-400">No tenant conversations yet.</div>'; return; }
+    box.innerHTML = S.threads.map(t =>
+      '<div class="act' + (S.sel && S.sel.id === t.id ? ' sel' : '') + '" data-t="' + esc(t.id) + '">' +
+        '<img class="av" src="' + esc(avatar(t.tenantName)) + '" alt="">' +
+        '<div class="min-w-0"><div class="nm">' + esc(t.tenantName) +
+          (t.tenantOnline ? ' <span style="color:#22c55e">●</span>' : '') + '</div>' +
+          '<div class="pv">' + esc(t.lastMessage ? (t.lastMessage.text || '[attachment]') : 'New conversation') + '</div>' +
+          '<div class="pv" style="color:#94a3b8">' + esc(t.reservationId) + ' · ' + esc(t.reservationStatus) +
+          (t.reservationCredit > 0 ? ' · Credit ' + money(t.reservationCredit) : '') + '</div></div>' +
+        (t.unreadAdmin ? '<span class="un">' + t.unreadAdmin + '</span>' : '<span class="un" style="background:#e2e8f0;color:#64748b">' + fmt(t.lastAt).split(',')[0] + '</span>') +
+      '</div>').join('');
+    box.querySelectorAll('.act').forEach(n => n.addEventListener('click', () => select(n.getAttribute('data-t'))));
+  }
+
+  async function refreshThreads(){
+    try {
+      const j = await jf('/api/chat/threads' + (S.q ? '?q=' + encodeURIComponent(S.q) : ''));
+      S.threads = j.threads;
+      S.unread = j.unreadTotal;
+      const b = el('adm-chat-badge');
+      b.textContent = S.unread; b.style.display = S.unread ? 'grid' : 'none';
+      const sum = await jf('/api/chat/summary');
+      el('adm-chat-stats').textContent = sum.threads + ' conversation(s) · ' + sum.unreadTotal + ' unread · ' + sum.receiptsAwaiting + ' receipt(s) awaiting review';
+      renderThreads();
+    } catch(_){}
+  }
+
+  async function loadMessages(replace){
+    if (!S.sel) return;
+    try {
+      const j = await jf('/api/chat/messages?role=admin&threadId=' + encodeURIComponent(S.sel.id) + (replace || !S.since ? '' : '&since=' + encodeURIComponent(S.since)));
+      S.sel = j.thread;
+      const body = el('adm-chat-body');
+      if (replace || !S.since) body.innerHTML = '';
+      if (j.messages.length){
+        body.insertAdjacentHTML('beforeend', j.messages.map(m => bubble(m, j.receipts)).join(''));
+        S.since = j.messages[j.messages.length - 1].at;
+        body.scrollTop = body.scrollHeight;
+        bindCards();
+      }
+      el('adm-chat-meta').textContent = j.thread.reservationId + ' · ' + j.thread.reservationStatus +
+        (j.thread.reservationCredit > 0 ? ' · Reservation Credit ' + money(j.thread.reservationCredit) : '') +
+        (j.thread.tenantOnline ? ' · online' : '');
+      if (S.open) jf('/api/chat/read', { method:'POST', body: JSON.stringify({ threadId: S.sel.id, role:'admin' }) }).catch(()=>{});
+    } catch(_){}
+  }
+
+  function bindCards(){
+    const body = el('adm-chat-body');
+    body.querySelectorAll('img.lb, img.rcpt-img').forEach(img => img.onclick = () => {
+      const lb = el('adm-chat-lb'); lb.querySelector('img').src = img.src; lb.classList.add('open');
+    });
+    body.querySelectorAll('[data-rcpt]').forEach(card => {
+      const id = card.getAttribute('data-rcpt');
+      const ok = card.querySelector('.rc-ok'), no = card.querySelector('.rc-no'), re = card.querySelector('.rc-re');
+      if (ok) ok.onclick = () => decide(id, 'approve');
+      if (no) no.onclick = () => decide(id, 'reject');
+      if (re) re.onclick = async () => { try { await jf('/api/receipts/' + id + '/reocr', { method:'POST' }); S.since = null; loadMessages(true); } catch(e){ alert(e.message); } };
+    });
+  }
+
+  async function decide(id, decision){
+    const note = prompt(decision === 'approve'
+      ? 'Optional note for the tenant (approval):'
+      : 'Reason for rejection (sent to the tenant):', '');
+    if (decision === 'reject' && note === null) return;
+    try {
+      await jf('/api/receipts/' + id + '/decision', { method:'POST', body: JSON.stringify({ decision, note: note || '' }) });
+      S.since = null;
+      await loadMessages(true);
+      await refreshThreads();
+      // Keep the rest of the Admin Portal in sync (reservations, billing, archive).
+      await pullDatabase();
+    } catch(e){ alert(e.message); }
+  }
+
+  /* Pull the shared database and repaint the Admin Portal — the receipt
+   * archive, reservations and billing all read from the same record set. */
+  async function pullDatabase(){
+    try {
+      const fresh = await jf('/api/data');
+      if (fresh && Array.isArray(fresh.rooms)) {
+        window.bhmsData = fresh;
+        if (typeof window.refreshAllViews === 'function') window.refreshAllViews();
+      }
+    } catch(_){}
+  }
+
+  async function select(id){
+    S.sel = S.threads.find(t => String(t.id) === String(id)) || null;
+    S.since = null;
+    if (!S.sel) return;
+    el('adm-chat-name').textContent = S.sel.tenantName;
+    el('adm-chat-av').src = avatar(S.sel.tenantName);
+    el('adm-chat').classList.remove('list');
+    renderThreads();
+    await loadMessages(true);
+  }
+
+  async function send(){
+    const inp = el('adm-chat-input');
+    const text = inp.value.trim();
+    if (!text || !S.sel) return;
+    inp.value = '';
+    try { await jf('/api/chat/message', { method:'POST', body: JSON.stringify({ threadId: S.sel.id, role:'admin', text }) }); await loadMessages(false); await refreshThreads(); }
+    catch(e){ alert(e.message); inp.value = text; }
+  }
+
+  el('adm-chat-send').onclick = send;
+  el('adm-chat-input').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); send(); } });
+  el('adm-chat-file').addEventListener('change', e => {
+    const f = e.target.files[0]; if (!f || !S.sel) return;
+    const fr = new FileReader();
+    fr.onload = async () => {
+      try { await jf('/api/chat/message', { method:'POST', body: JSON.stringify({ threadId: S.sel.id, role:'admin', text:'', attachment:{ dataUrl: fr.result, name: f.name, mime: f.type } }) }); await loadMessages(false); }
+      catch(err){ alert(err.message); }
+    };
+    fr.readAsDataURL(f); e.target.value = '';
+  });
+  el('adm-chat-search').addEventListener('input', e => { S.q = e.target.value.trim(); refreshThreads(); });
+  el('adm-chat-lb').onclick = () => el('adm-chat-lb').classList.remove('open');
+  el('adm-chat-back').onclick = () => el('adm-chat').classList.add('list');
+
+  function open(){ S.open = true; el('adm-chat').classList.add('open'); el('adm-chat-fab').style.display = 'none'; refreshThreads(); loadMessages(true); }
+  function close(){ S.open = false; el('adm-chat').classList.remove('open'); el('adm-chat-fab').style.display = 'grid'; }
+  el('adm-chat-fab').onclick = open;
+  el('adm-chat-x').onclick = close;
+  el('adm-chat-x2').onclick = close;
+
+  window.AdminChat = { open, close, refresh: refreshThreads, openReservation(resId){
+    open();
+    const t = S.threads.find(x => String(x.reservationId) === String(resId));
+    if (t) select(t.id);
+  } };
+
+  setInterval(() => {
+    if (document.visibilityState !== 'visible') return;
+    refreshThreads();
+    if (S.open && S.sel) loadMessages(false);
+  }, POLL_MS);
+  refreshThreads();
+})();
+</script>
+
 </body>
 </html>
