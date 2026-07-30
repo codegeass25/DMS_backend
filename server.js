@@ -2284,6 +2284,23 @@ app.post('/api/data', (req, res) => {
         merged.emailLogs = Array.isArray(existing.emailLogs) ? existing.emailLogs : [];
         // Force-preserve emailCounter from disk (frontend sends none)
         merged.emailCounter = (existing.emailCounter && typeof existing.emailCounter === 'object') ? existing.emailCounter : {};
+        // Force-preserve server-owned realtime collections. The portals push a
+        // whole snapshot; a stale copy must never clobber live conversations,
+        // archived receipts or the binary upload store.
+        merged.chatThreads    = Array.isArray(existing.chatThreads)    ? existing.chatThreads    : [];
+        merged.chatMessages   = Array.isArray(existing.chatMessages)   ? existing.chatMessages   : [];
+        // Receipt Archive is co-owned: OCR/chat records are written by the server,
+        // manual archive entries by the Admin Portal. Union by id, server wins.
+        {
+            const _srv = Array.isArray(existing.receiptArchive) ? existing.receiptArchive : [];
+            const _cli = Array.isArray(incoming.receiptArchive) ? incoming.receiptArchive : [];
+            const _byId = new Map();
+            _cli.forEach(r => { if (r && r.id) _byId.set(String(r.id), r); });
+            _srv.forEach(r => { if (r && r.id) _byId.set(String(r.id), r); });
+            merged.receiptArchive = Array.from(_byId.values());
+        }
+        merged.uploads        = existing.uploads  || {};
+        merged.presence       = existing.presence || {};
         // FIX: White Label branding is owned exclusively by /api/whitelabel.
         // The frontend syncs its whole snapshot here, and a stale copy used to
         // overwrite freshly saved branding (sender name, colors...). Always keep
@@ -2311,6 +2328,16 @@ app.post('/api/data', (req, res) => {
         // === NEW: Server-side validation for check-in scope & payment integrity ===
         try {
             const _priorIds = new Set((existing.boarders || []).map(b => b.id));
+            // AUTOMATIC RESERVATION CREDIT: newly checked-in boarders inherit
+            // any credit verified from their GCash receipt.
+            // Rental Fee + Security Deposit - Reservation Credit = Balance.
+            try {
+                (merged.boarders || []).forEach(b => {
+                    if (_priorIds.has(b.id)) return;
+                    if (b.reservationCredit != null) return;
+                    applyReservationCreditToBoarder(merged, b);
+                });
+            } catch (_e) { console.warn('[RES-CREDIT] sweep warn:', _e.message); }
             const _reservations = Array.isArray(merged.reservations) ? merged.reservations : [];
             const _resById = new Map(_reservations.map(r => [r.id, r]));
             const _incomingBoarders = Array.isArray(merged.boarders) ? merged.boarders : [];
@@ -2529,6 +2556,7 @@ app.post('/api/boarders', (req, res) => {
         validateBoarderPayload(record);
         if (!record.id) {
             record.id = 'BRD-' + Date.now();
+            try { applyReservationCreditToBoarder(db, record); } catch (_e) { console.warn('[RES-CREDIT]', _e.message); }
             db.boarders.push(record);
             appendAuditEntry('Boarder Directory', `Created new tenant: ${record.name}`, req);
         } else {
@@ -2926,6 +2954,574 @@ function schedulerTick() {
 }
 
 // Global error handler
+
+/* ====================================================================
+ * REAL-TIME MESSENGER · OCR RECEIPT VERIFICATION · RESERVATION CREDIT
+ * --------------------------------------------------------------------
+ * Extends the existing system. No branding, pricing, reservation or
+ * billing logic is duplicated here — every value is read from the same
+ * records already used by the Admin Portal (SSOT):
+ *
+ *   db.chatThreads[]    conversations (1 per reservation)
+ *   db.chatMessages[]   messages (text / image / receipt)
+ *   db.receiptArchive[] uploaded receipts + OCR results + decisions
+ *   db.uploads{}        binary store already used by /uploads/:filename
+ *
+ * Realtime is delivered by delta polling (`?since=`), the same cadence
+ * mechanism the portals already use, so it works on any host.
+ * ==================================================================== */
+
+const CHAT_ROLES = ['tenant', 'admin'];
+const OCR_MIN_CONFIDENCE = Number(process.env.OCR_MIN_CONFIDENCE || 0.75);
+const PRESENCE_WINDOW_MS = 25000;
+
+function chatEnsure(db) {
+    db.chatThreads   = Array.isArray(db.chatThreads)   ? db.chatThreads   : [];
+    db.chatMessages  = Array.isArray(db.chatMessages)  ? db.chatMessages  : [];
+    db.receiptArchive = Array.isArray(db.receiptArchive) ? db.receiptArchive : [];
+    db.uploads       = db.uploads || {};
+    db.presence      = db.presence || {};
+    return db;
+}
+
+/** Persist a base64 data URL into the existing /uploads store. */
+function chatStoreImage(db, id, dataUrl) {
+    const m = String(dataUrl || '').match(/^data:(image\/(png|jpe?g|webp|gif)|application\/pdf);base64,(.+)$/i);
+    if (!m) return null;
+    const mime = m[1].toLowerCase();
+    const ext = mime === 'application/pdf' ? 'pdf' : (mime.split('/')[1] === 'jpeg' ? 'jpg' : mime.split('/')[1]);
+    const filename = 'chat_' + String(id).replace(/[^a-zA-Z0-9_.-]/g, '_') + '.' + ext;
+    db.uploads[filename] = { mime, base64: m[3], updatedAt: new Date().toISOString() };
+    return { path: '/uploads/' + filename, mime, base64: m[3], filename };
+}
+
+function chatFindThread(db, threadId) {
+    return db.chatThreads.find(t => String(t.id) === String(threadId)) || null;
+}
+
+function chatThreadView(db, t) {
+    const msgs = db.chatMessages.filter(m => String(m.threadId) === String(t.id));
+    const last = msgs[msgs.length - 1] || null;
+    const res = (db.reservations || []).find(r => String(r.id) === String(t.reservationId)) || {};
+    return {
+        ...t,
+        reservationStatus: res.status || t.reservationStatus || 'Pending',
+        reservationCredit: Number(res.reservationCredit || 0),
+        lastMessage: last ? { text: last.text, kind: last.kind, at: last.at, role: last.role } : null,
+        lastAt: last ? last.at : t.createdAt,
+        unreadAdmin: msgs.filter(m => m.role === 'tenant' && !m.readByAdmin).length,
+        unreadTenant: msgs.filter(m => m.role === 'admin' && !m.readByTenant).length,
+        tenantOnline: (Date.now() - Number((db.presence || {})['tenant:' + t.id] || 0)) < PRESENCE_WINDOW_MS,
+        adminOnline: (Date.now() - Number((db.presence || {})['admin:' + t.id] || 0)) < PRESENCE_WINDOW_MS,
+        messageCount: msgs.length
+    };
+}
+
+/* --------------------------------------------------------------------
+ * OCR ENGINE
+ * Uses an AI vision model through an OpenAI-compatible endpoint when a
+ * key is configured; otherwise every receipt falls back to
+ * "Manual Verification Required" (never auto-approved).
+ * ------------------------------------------------------------------ */
+const OCR_ENDPOINT = process.env.OCR_API_URL || 'https://ai.gateway.lovable.dev/v1/chat/completions';
+const OCR_MODEL    = process.env.OCR_MODEL   || 'google/gemini-3.6-flash';
+
+function ocrKey() {
+    return process.env.LOVABLE_API_KEY || process.env.OCR_API_KEY || process.env.OPENAI_API_KEY || '';
+}
+
+async function runReceiptOcr(dataUrl) {
+    const key = ocrKey();
+    if (!key) {
+        return { ok: false, confidence: 0, readable: false, engine: 'none',
+                 error: 'No OCR key configured (LOVABLE_API_KEY / OCR_API_KEY).', fields: {} };
+    }
+    const headers = { 'Content-Type': 'application/json' };
+    if (process.env.LOVABLE_API_KEY && !process.env.OCR_API_KEY && !process.env.OPENAI_API_KEY) {
+        headers['Lovable-API-Key'] = key;
+    } else {
+        headers['Authorization'] = 'Bearer ' + key;
+    }
+    const prompt =
+        'You are an OCR engine for GCash / e-wallet payment receipts. Read the image and return ONLY minified JSON ' +
+        'with these keys: referenceNumber, senderName, receiverName, amount (number, no symbols), date (YYYY-MM-DD), ' +
+        'time (HH:MM), readable (boolean - is the image legible), authentic (boolean - does it look like a genuine ' +
+        'unedited payment receipt), confidence (0..1 how certain you are of ALL extracted fields), notes (short string). ' +
+        'Use empty string for anything you cannot read. Never invent values.';
+    try {
+        const r = await fetch(OCR_ENDPOINT, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+                model: OCR_MODEL,
+                messages: [{
+                    role: 'user',
+                    content: [
+                        { type: 'text', text: prompt },
+                        { type: 'image_url', image_url: { url: dataUrl } }
+                    ]
+                }]
+            })
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) {
+            return { ok: false, confidence: 0, readable: false, engine: OCR_MODEL,
+                     error: (j.error && (j.error.message || j.error)) || ('OCR HTTP ' + r.status), fields: {} };
+        }
+        const txt = ((j.choices || [])[0] || {}).message || {};
+        let raw = typeof txt.content === 'string' ? txt.content
+                : Array.isArray(txt.content) ? txt.content.map(p => p.text || '').join('') : '';
+        const match = raw.match(/\{[\s\S]*\}/);
+        const parsed = match ? JSON.parse(match[0]) : {};
+        const amount = parseFloat(String(parsed.amount || '').toString().replace(/[^0-9.]/g, '')) || 0;
+        return {
+            ok: true,
+            engine: OCR_MODEL,
+            confidence: Math.max(0, Math.min(1, Number(parsed.confidence) || 0)),
+            readable: parsed.readable !== false,
+            authentic: parsed.authentic !== false,
+            notes: parsed.notes || '',
+            fields: {
+                referenceNumber: String(parsed.referenceNumber || '').trim(),
+                senderName: String(parsed.senderName || '').trim(),
+                receiverName: String(parsed.receiverName || '').trim(),
+                amount,
+                date: String(parsed.date || '').trim(),
+                time: String(parsed.time || '').trim()
+            },
+            rawText: raw.slice(0, 4000)
+        };
+    } catch (e) {
+        return { ok: false, confidence: 0, readable: false, engine: OCR_MODEL, error: e.message, fields: {} };
+    }
+}
+
+/** Decide the verification status of an OCR result (never throws). */
+function classifyReceipt(db, ocr, reservation) {
+    const f = ocr.fields || {};
+    if (!ocr.ok || !ocr.readable) return { status: 'Manual Verification Required', reason: ocr.error || 'Receipt image is not readable.' };
+    if (ocr.authentic === false)  return { status: 'Rejected', reason: 'The receipt did not pass the authenticity check.' };
+    if (!f.referenceNumber)       return { status: 'Manual Verification Required', reason: 'Reference number could not be extracted.' };
+    const dupe = db.receiptArchive.find(x =>
+        x.referenceNumber && f.referenceNumber &&
+        String(x.referenceNumber).toUpperCase() === String(f.referenceNumber).toUpperCase() &&
+        x.verificationStatus !== 'Rejected');
+    if (dupe) return { status: 'Rejected', reason: 'Duplicate receipt — reference ' + f.referenceNumber + ' was already submitted.', duplicateOf: dupe.id };
+    if (!(f.amount > 0))          return { status: 'Manual Verification Required', reason: 'Payment amount could not be extracted.' };
+    if (ocr.confidence < OCR_MIN_CONFIDENCE)
+        return { status: 'Manual Verification Required', reason: 'OCR confidence ' + Math.round(ocr.confidence * 100) + '% is below the ' + Math.round(OCR_MIN_CONFIDENCE * 100) + '% threshold.' };
+    return { status: 'Verified', reason: 'Automatically verified by OCR.' };
+}
+
+/** Credit a verified receipt to its reservation (idempotent per receipt). */
+function creditReservation(db, receipt) {
+    const res = (db.reservations || []).find(r => String(r.id) === String(receipt.reservationId));
+    if (!res || receipt.credited) return res || null;
+    res.reservationCredit = Number(res.reservationCredit || 0) + Number(receipt.amount || 0);
+    res.reservationCreditRefs = Array.isArray(res.reservationCreditRefs) ? res.reservationCreditRefs : [];
+    res.reservationCreditRefs.push(receipt.id);
+    res.paymentStatus = 'Reservation Credit';
+    res.paymentReference = receipt.referenceNumber || res.paymentReference || '';
+    res.reference = res.reference || receipt.referenceNumber || '';
+    res.receiptId = receipt.id;
+    res.ocr = receipt.ocr || null;
+    receipt.credited = true;
+    receipt.creditAmount = Number(receipt.amount || 0);
+    db.transactions = Array.isArray(db.transactions) ? db.transactions : [];
+    db.transactions.push({
+        id: 'TX-RC-' + Date.now() + Math.floor(Math.random() * 10),
+        type: 'Reservation Credit',
+        reservationId: res.id,
+        boarderId: res.boarderId || null,
+        date: new Date().toISOString().split('T')[0],
+        amount: Number(receipt.amount || 0),
+        reference: receipt.referenceNumber || '',
+        details: 'Reservation credit from verified GCash receipt ' + (receipt.referenceNumber || receipt.id)
+    });
+    return res;
+}
+
+/**
+ * Deduct any stored Reservation Credit when a reservation becomes an
+ * Active Boarder. Rental Fee + Security Deposit − Reservation Credit.
+ * Idempotent: the credit can only be consumed once per reservation.
+ */
+function applyReservationCreditToBoarder(db, boarder) {
+    if (!boarder) return null;
+    const res = (db.reservations || []).find(r =>
+        (boarder.reservationId && String(r.id) === String(boarder.reservationId)) ||
+        (r.email && boarder.email && String(r.email).toLowerCase() === String(boarder.email).toLowerCase() &&
+         String(r.roomId) === String(boarder.roomId) && !r.creditApplied));
+    if (!res) return null;
+    const credit = Number(res.reservationCredit || 0);
+    if (!credit || res.creditApplied) return null;
+
+    const rent = Number(boarder.rentalFee != null ? boarder.rentalFee : (boarder.monthlyRate || boarder.rate || 0)) || 0;
+    const deposit = Number(boarder.securityDeposit != null ? boarder.securityDeposit : (boarder.deposit || 0)) || 0;
+    const gross = rent + deposit;
+    const applied = Math.min(credit, gross);
+
+    boarder.reservationId = res.id;
+    boarder.reservationCredit = applied;
+    boarder.grossMoveInCharges = gross;
+    boarder.balance = Math.max(0, gross - applied);
+    if (boarder.balance === 0) boarder.status = boarder.status === 'Active' ? 'Active' : (boarder.status || 'Active');
+
+    res.creditApplied = true;
+    res.creditAppliedAt = new Date().toISOString();
+    res.boarderId = boarder.id;
+
+    db.transactions = Array.isArray(db.transactions) ? db.transactions : [];
+    db.transactions.push({
+        id: 'TX-RCA-' + Date.now() + Math.floor(Math.random() * 10),
+        type: 'Reservation Credit Applied',
+        boarderId: boarder.id,
+        reservationId: res.id,
+        date: new Date().toISOString().split('T')[0],
+        amount: applied,
+        reference: res.paymentReference || '',
+        details: 'Reservation credit applied at check-in. Rental ' + rent + ' + Deposit ' + deposit + ' − Credit ' + applied + ' = Balance ' + boarder.balance
+    });
+    (db.receiptArchive || []).forEach(rc => { if (String(rc.reservationId) === String(res.id)) rc.appliedToBoarderId = boarder.id; });
+    return { applied, gross, balance: boarder.balance };
+}
+
+/* Exposed so the Admin Portal can preview the computation before saving. */
+app.post('/api/reservation-credit/preview', (req, res) => {
+    try {
+        const db = chatEnsure(readStorage());
+        const { reservationId, rentalFee, securityDeposit } = req.body || {};
+        const r = (db.reservations || []).find(x => String(x.id) === String(reservationId));
+        const credit = r && !r.creditApplied ? Number(r.reservationCredit || 0) : 0;
+        const gross = (Number(rentalFee) || 0) + (Number(securityDeposit) || 0);
+        res.json({ credit, gross, balance: Math.max(0, gross - Math.min(credit, gross)), creditApplied: !!(r && r.creditApplied) });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/* -------------------------- CHAT ENDPOINTS ------------------------- */
+
+/** Open (or resume) the conversation attached to a reservation. */
+app.post('/api/chat/thread', (req, res) => {
+    try {
+        const db = chatEnsure(readStorage());
+        const { reservationId, name, email, contact } = req.body || {};
+        if (!reservationId) return res.status(400).json({ error: 'reservationId is required.' });
+        const reservation = (db.reservations || []).find(r => String(r.id) === String(reservationId));
+        if (!reservation) return res.status(404).json({ error: 'Reservation not found.' });
+
+        let t = db.chatThreads.find(x => String(x.reservationId) === String(reservationId));
+        if (!t) {
+            t = {
+                id: 'CHT-' + Date.now(),
+                reservationId: String(reservationId),
+                tenantName: name || reservation.name || 'Tenant',
+                tenantEmail: email || reservation.email || '',
+                tenantContact: contact || reservation.contact || '',
+                roomId: reservation.roomId || null,
+                createdAt: new Date().toISOString(),
+                status: 'Open'
+            };
+            db.chatThreads.push(t);
+            db.chatMessages.push({
+                id: 'MSG-' + Date.now(),
+                threadId: t.id, role: 'system', kind: 'text',
+                text: 'Reservation ' + reservationId + ' submitted. You may now send your GCash receipt here for automatic verification.',
+                at: new Date().toISOString(), readByAdmin: false, readByTenant: true, delivered: true
+            });
+            appendAuditEntry('Tenant Messenger', 'Conversation opened for reservation ' + reservationId, req);
+            writeStorageAtomic(db);
+        }
+        res.json({ success: true, thread: chatThreadView(db, t) });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/** Admin conversation list (delta friendly). */
+app.get('/api/chat/threads', (req, res) => {
+    try {
+        const db = chatEnsure(readStorage());
+        const q = String(req.query.q || '').toLowerCase();
+        let list = db.chatThreads.map(t => chatThreadView(db, t));
+        if (q) list = list.filter(t =>
+            String(t.tenantName).toLowerCase().includes(q) ||
+            String(t.tenantEmail).toLowerCase().includes(q) ||
+            String(t.reservationId).toLowerCase().includes(q));
+        list.sort((a, b) => String(b.lastAt || '').localeCompare(String(a.lastAt || '')));
+        res.json({
+            threads: list,
+            unreadTotal: list.reduce((n, t) => n + t.unreadAdmin, 0),
+            serverTime: new Date().toISOString()
+        });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/** Message delta feed. Also refreshes presence for the calling role. */
+app.get('/api/chat/messages', (req, res) => {
+    try {
+        const db = chatEnsure(readStorage());
+        const { threadId, since, role } = req.query;
+        const t = chatFindThread(db, threadId);
+        if (!t) return res.status(404).json({ error: 'Conversation not found.' });
+        if (CHAT_ROLES.includes(role)) {
+            db.presence[role + ':' + t.id] = Date.now();
+            writeStorageAtomic(db);
+        }
+        const all = db.chatMessages.filter(m => String(m.threadId) === String(t.id));
+        const list = since ? all.filter(m => String(m.at) > String(since)) : all;
+        res.json({
+            thread: chatThreadView(db, t),
+            messages: list,
+            receipts: db.receiptArchive.filter(r => String(r.threadId) === String(t.id)),
+            serverTime: new Date().toISOString()
+        });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/** Mark a conversation as read for one side. */
+app.post('/api/chat/read', (req, res) => {
+    try {
+        const db = chatEnsure(readStorage());
+        const { threadId, role } = req.body || {};
+        if (!CHAT_ROLES.includes(role)) return res.status(400).json({ error: 'role must be tenant or admin.' });
+        db.chatMessages.forEach(m => {
+            if (String(m.threadId) !== String(threadId)) return;
+            if (role === 'admin' && m.role !== 'admin') m.readByAdmin = true;
+            if (role === 'tenant' && m.role !== 'tenant') m.readByTenant = true;
+        });
+        writeStorageAtomic(db);
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/** Typing / online heartbeat. */
+app.post('/api/chat/typing', (req, res) => {
+    try {
+        const db = chatEnsure(readStorage());
+        const { threadId, role, typing } = req.body || {};
+        if (!CHAT_ROLES.includes(role)) return res.status(400).json({ error: 'Invalid role.' });
+        db.presence[role + ':' + threadId] = Date.now();
+        if (typing) db.presence['typing:' + role + ':' + threadId] = Date.now();
+        writeStorageAtomic(db);
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/**
+ * Send a message. When `kind === 'receipt'` the attached image is OCR'd,
+ * archived, validated and — when it passes — automatically credited to
+ * the reservation. Everything happens against the existing records.
+ */
+app.post('/api/chat/message', async (req, res) => {
+    try {
+        const db = chatEnsure(readStorage());
+        const { threadId, role, text, attachment, kind, clientId } = req.body || {};
+        if (!CHAT_ROLES.includes(role)) return res.status(400).json({ error: 'role must be tenant or admin.' });
+        const t = chatFindThread(db, threadId);
+        if (!t) return res.status(404).json({ error: 'Conversation not found.' });
+        if (!text && !attachment) return res.status(400).json({ error: 'Message text or an attachment is required.' });
+
+        const now = new Date().toISOString();
+        const msgId = 'MSG-' + Date.now() + Math.floor(Math.random() * 100);
+        let stored = null;
+        if (attachment && attachment.dataUrl) {
+            stored = chatStoreImage(db, msgId, attachment.dataUrl);
+            if (!stored) return res.status(400).json({ error: 'Unsupported attachment. Upload a PNG, JPG, WEBP or PDF.' });
+        }
+
+        const msg = {
+            id: msgId, clientId: clientId || null, threadId: t.id, role,
+            kind: stored ? (kind === 'receipt' ? 'receipt' : 'image') : 'text',
+            text: String(text || '').slice(0, 4000),
+            attachment: stored ? { path: stored.path, name: attachment.name || stored.filename, mime: stored.mime } : null,
+            at: now, delivered: true,
+            readByAdmin: role === 'admin', readByTenant: role === 'tenant',
+            sender: role === 'admin' ? ((req.mdmsUser && req.mdmsUser.name) || 'Administrator') : t.tenantName
+        };
+        db.chatMessages.push(msg);
+        db.presence[role + ':' + t.id] = Date.now();
+        writeStorageAtomic(db);
+
+        let receipt = null;
+        if (msg.kind === 'receipt') {
+            const ocr = await runReceiptOcr(attachment.dataUrl);
+            const fresh = chatEnsure(readStorage());
+            const verdict = classifyReceipt(fresh, ocr, null);
+            const f = ocr.fields || {};
+            receipt = {
+                id: 'RCP-' + Date.now(),
+                messageId: msg.id,
+                threadId: t.id,
+                reservationId: t.reservationId,
+                tenantName: t.tenantName,
+                tenantEmail: t.tenantEmail,
+                imagePath: stored.path,
+                uploadDate: now,
+                referenceNumber: f.referenceNumber || '',
+                senderName: f.senderName || '',
+                receiverName: f.receiverName || '',
+                amount: Number(f.amount || 0),
+                paymentDate: f.date || '',
+                paymentTime: f.time || '',
+                ocr,
+                confidence: ocr.confidence,
+                verificationStatus: verdict.status,
+                verificationReason: verdict.reason,
+                duplicateOf: verdict.duplicateOf || null,
+                adminStatus: verdict.status === 'Verified' ? 'Auto-Approved' : 'Awaiting Review',
+                credited: false,
+                creditAmount: 0
+            };
+            fresh.receiptArchive.push(receipt);
+            if (verdict.status === 'Verified') creditReservation(fresh, receipt);
+
+            const summary = verdict.status === 'Verified'
+                ? 'Receipt verified automatically. Reference ' + receipt.referenceNumber + ' · ' +
+                  BrandingService.money(BrandingService.get(fresh), receipt.amount) + ' credited to reservation ' + t.reservationId + '.'
+                : verdict.status === 'Rejected'
+                    ? 'Receipt rejected: ' + verdict.reason
+                    : 'Manual Verification Required — ' + verdict.reason;
+            fresh.chatMessages.push({
+                id: 'MSG-' + Date.now() + 'S', threadId: t.id, role: 'system', kind: 'ocr',
+                text: summary, receiptId: receipt.id, at: new Date().toISOString(),
+                delivered: true, readByAdmin: false, readByTenant: false
+            });
+            appendAuditEntry('Receipt Archive', 'Receipt ' + receipt.id + ' (' + verdict.status + ') for reservation ' + t.reservationId, req);
+            writeStorageAtomic(fresh);
+
+            (async () => {
+                try {
+                    const d2 = readStorage();
+                    const cfg = d2.emailConfig;
+                    if (cfg && cfg.enabled && t.tenantEmail) {
+                        const brand = BrandingService.get(d2);
+                        await sendEmailWithRetry({
+                            to: t.tenantEmail,
+                            subject: '[' + brand.systemShortName + '] Receipt ' + verdict.status + ' — Reservation ' + t.reservationId,
+                            html: '<p>Hello ' + t.tenantName + ',</p><p>' + summary + '</p><p>' + brand.emailSignature + '</p>',
+                            type: 'Receipt Verification', config: cfg, settings: d2.settings
+                        });
+                    }
+                } catch (e) { console.error('[RECEIPT-EMAIL]', e.message); }
+            })();
+        }
+
+        const out = chatEnsure(readStorage());
+        res.json({ success: true, message: msg, receipt, thread: chatThreadView(out, chatFindThread(out, t.id)) });
+    } catch (e) { res.status(500).json({ error: 'Message failed.', details: e.message }); }
+});
+
+/* ---------------------- RECEIPT ARCHIVE / REVIEW -------------------- */
+
+app.get('/api/receipts', (req, res) => {
+    try {
+        const db = chatEnsure(readStorage());
+        const { status, reservationId } = req.query;
+        let list = db.receiptArchive.slice();
+        if (status) list = list.filter(r => r.verificationStatus === status);
+        if (reservationId) list = list.filter(r => String(r.reservationId) === String(reservationId));
+        list.sort((a, b) => String(b.uploadDate).localeCompare(String(a.uploadDate)));
+        res.json({ receipts: list, pending: db.receiptArchive.filter(r => r.adminStatus === 'Awaiting Review').length });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/** Administrator approves or rejects a receipt (also for manual review). */
+app.post('/api/receipts/:id/decision', (req, res) => {
+    try {
+        const db = chatEnsure(readStorage());
+        const { decision, note, amount } = req.body || {};
+        const rcp = db.receiptArchive.find(r => String(r.id) === String(req.params.id));
+        if (!rcp) return res.status(404).json({ error: 'Receipt not found.' });
+        if (!['approve', 'reject'].includes(decision)) return res.status(400).json({ error: 'decision must be approve or reject.' });
+
+        const who = (req.mdmsUser && req.mdmsUser.name) || 'Administrator';
+        if (decision === 'approve') {
+            if (amount != null && Number(amount) > 0) rcp.amount = Number(amount);
+            rcp.verificationStatus = 'Verified';
+            rcp.adminStatus = 'Approved';
+            creditReservation(db, rcp);
+        } else {
+            rcp.verificationStatus = 'Rejected';
+            rcp.adminStatus = 'Rejected';
+        }
+        rcp.reviewedBy = who;
+        rcp.reviewedAt = new Date().toISOString();
+        rcp.adminNote = note || '';
+
+        const brand = BrandingService.get(db);
+        db.chatMessages.push({
+            id: 'MSG-' + Date.now() + 'D', threadId: rcp.threadId, role: 'system', kind: 'ocr',
+            receiptId: rcp.id,
+            text: decision === 'approve'
+                ? 'Administrator approved your receipt. ' + BrandingService.money(brand, rcp.amount) + ' credited to reservation ' + rcp.reservationId + '.' + (note ? ' Note: ' + note : '')
+                : 'Administrator rejected your receipt.' + (note ? ' Reason: ' + note : ''),
+            at: new Date().toISOString(), delivered: true, readByAdmin: true, readByTenant: false
+        });
+        appendAuditEntry('Receipt Archive', 'Receipt ' + rcp.id + ' ' + decision + 'd by ' + who, req);
+        writeStorageAtomic(db);
+
+        (async () => {
+            try {
+                const d2 = readStorage();
+                const cfg = d2.emailConfig;
+                if (cfg && cfg.enabled && rcp.tenantEmail) {
+                    await sendEmailWithRetry({
+                        to: rcp.tenantEmail,
+                        subject: '[' + brand.systemShortName + '] Receipt ' + (decision === 'approve' ? 'Approved' : 'Rejected'),
+                        html: '<p>Hello ' + rcp.tenantName + ',</p><p>Your receipt for reservation ' + rcp.reservationId +
+                              ' was ' + (decision === 'approve' ? 'approved' : 'rejected') + '.' + (note ? ' Note: ' + note : '') + '</p><p>' + brand.emailSignature + '</p>',
+                        type: 'Receipt Decision', config: cfg, settings: d2.settings
+                    });
+                }
+            } catch (e) { console.error('[RECEIPT-DECISION-EMAIL]', e.message); }
+        })();
+
+        res.json({ success: true, receipt: rcp });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/** Re-run OCR on an archived receipt (retry / after a better upload). */
+app.post('/api/receipts/:id/reocr', async (req, res) => {
+    try {
+        const db = chatEnsure(readStorage());
+        const rcp = db.receiptArchive.find(r => String(r.id) === String(req.params.id));
+        if (!rcp) return res.status(404).json({ error: 'Receipt not found.' });
+        const file = (db.uploads || {})[String(rcp.imagePath).split('/').pop()];
+        if (!file) return res.status(404).json({ error: 'Stored receipt image is missing.' });
+        const ocr = await runReceiptOcr('data:' + file.mime + ';base64,' + file.base64);
+        const fresh = chatEnsure(readStorage());
+        const target = fresh.receiptArchive.find(r => String(r.id) === String(rcp.id));
+        const verdict = classifyReceipt(
+            { receiptArchive: fresh.receiptArchive.filter(r => String(r.id) !== String(rcp.id)) }, ocr, null);
+        Object.assign(target, {
+            ocr, confidence: ocr.confidence,
+            referenceNumber: (ocr.fields || {}).referenceNumber || target.referenceNumber,
+            senderName: (ocr.fields || {}).senderName || target.senderName,
+            receiverName: (ocr.fields || {}).receiverName || target.receiverName,
+            amount: Number((ocr.fields || {}).amount || target.amount || 0),
+            paymentDate: (ocr.fields || {}).date || target.paymentDate,
+            paymentTime: (ocr.fields || {}).time || target.paymentTime,
+            verificationStatus: target.adminStatus === 'Approved' ? target.verificationStatus : verdict.status,
+            verificationReason: verdict.reason
+        });
+        if (target.verificationStatus === 'Verified' && !target.credited) creditReservation(fresh, target);
+        writeStorageAtomic(fresh);
+        res.json({ success: true, receipt: target });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/** Aggregate poll used by the Admin notification badge. */
+app.get('/api/chat/summary', (req, res) => {
+    try {
+        const db = chatEnsure(readStorage());
+        const threads = db.chatThreads.map(t => chatThreadView(db, t));
+        res.json({
+            unreadTotal: threads.reduce((n, t) => n + t.unreadAdmin, 0),
+            threads: threads.length,
+            receiptsAwaiting: db.receiptArchive.filter(r => r.adminStatus === 'Awaiting Review').length,
+            serverTime: new Date().toISOString()
+        });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.use((err, req, res, next) => {
     console.error('CAPTURED ROOT EXCEPTION:', err.stack);
     res.status(500).json({ error: 'System error.', context: err.message });
