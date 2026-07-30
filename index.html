@@ -1632,7 +1632,10 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
                 refreshEmailLogsFromServer();
                 __emailLogsPoll = setInterval(refreshEmailLogsFromServer, 5000);
             }
-            if (viewId === 'receiptArchive') { try { renderReceiptArchive(); } catch(e){ console.error(e); } }
+            // Always pull the authoritative Official Receipt list when the
+            // Receipt Archive opens (it renders backend records only).
+            if (viewId === 'receiptArchive') { try { raLoadOfficialReceipts(); } catch(e){ console.error(e); } }
+
         }
 
         // FIX #4: opening User Management from the SA dropdown must go
@@ -1665,7 +1668,11 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             if(!bhmsData) return;
             renderDashboard(); renderMap(); renderBoarders(); renderFormerBoarders(); renderReservations(); renderBilling(); renderMaintenance(); renderSettings(); renderEmailLogs(); updateBadges(); generateReport();
             // Live sync: every save repaints secondary surfaces too — no manual refresh.
-            try { if (typeof renderReceiptArchive === 'function') renderReceiptArchive(); } catch (_) {}
+            try {
+                if (document.getElementById('receiptArchive')?.classList.contains('active')) raLoadOfficialReceipts();
+                else if (typeof renderReceiptArchive === 'function') renderReceiptArchive();
+            } catch (_) {}
+
             try { if (typeof window.renderUserTable === 'function') window.renderUserTable(); } catch (_) {}
             try { if (typeof window.mdmsApplyPerms === 'function') window.mdmsApplyPerms(); } catch (_) {}
             // If a room-details modal is currently open, repaint it so bed/room state changes are visible immediately.
@@ -1982,52 +1989,86 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             });
         }
 
-        function _renderRoomCard(room, statusMeta, floorName) {
-            // Reads room state ONLY; identical calculations to the original renderer.
-            const isAdmin = room.type === 'Admin';
-            let displayStatus = room.status;
-            let occCount = room.occupied || 0;
-            let resCount = room.beds ? room.beds.filter(b=>b.isReserved).length : 0;
-            const capacity = room.capacity || (room.beds ? room.beds.length : 0);
+        /* ================================================================
+         * OCCUPANCY — SINGLE SOURCE OF TRUTH (client adapter)
+         * The backend ships `room.occupancy` (see computeRoomOccupancy in
+         * server.js). The map RENDERS it verbatim and never recomputes.
+         * This local fallback exists only for offline/seed data and is an
+         * exact mirror of the server rules:
+         *   Entire Room + Checked-in -> 1 OCC / 0 RES / ENTIRE ROOM
+         *   Entire Room + Reserved   -> 0 OCC / 1 RES / ENTIRE ROOM
+         *   Bed Space                -> real per-bed counts
+         * ================================================================ */
+        function getRoomOccupancy(room) {
+            if (room && room.occupancy && typeof room.occupancy === 'object') return room.occupancy;
 
-            // FINAL FIX — an entire-room OCCUPANT (transferred or checked-in)
-            // always counts as exactly ONE logical occupant, never the physical
-            // bed capacity, even though all beds are internally locked.
-            const _entireOwner = !isAdmin ? getEntireRoomOccupant(room) : null;
-            const _mapEntireRes = !isAdmin ? getActiveEntireRoomRes(room.id) : null;
-            if (_entireOwner || (_mapEntireRes && _mapEntireRes.status === 'Checked-in')) {
-                displayStatus = 'Fully Occupied';
-                occCount = 1; resCount = 0;
+            const capacity = room.capacity || (room.beds ? room.beds.length : 0);
+            if (room.type === 'Admin') {
+                return { mode:'admin', entireRoom:false, capacity, occupied:0, reserved:0, available:0,
+                         percent:0, status:'Admin', chips:[], showResChip:false, showFreeChip:false, locked:true };
             }
-            if (isAdmin) displayStatus = 'Admin';
+
+            const beds = room.beds || [];
+            const owner = (typeof getEntireRoomOccupant === 'function') ? getEntireRoomOccupant(room) : null;
+            const entireRes = (typeof getActiveEntireRoomRes === 'function') ? getActiveEntireRoomRes(room.id) : null;
+            const checkedIn = !!owner || !!(entireRes && entireRes.status === 'Checked-in');
+            const reservedWhole = !checkedIn && !!entireRes;
+
+            if (checkedIn) {
+                return { mode:'entire', entireRoom:true, capacity, occupied:1, reserved:0, available:0,
+                         percent:100, status:'Fully Occupied',
+                         occupantName:(owner && owner.name) || (entireRes && entireRes.name) || 'Occupant',
+                         chips:[{ kind:'occ', title:'Entire room occupant' }],
+                         showResChip:false, showFreeChip:false, locked:true };
+            }
+            if (reservedWhole) {
+                return { mode:'entire', entireRoom:true, capacity, occupied:0, reserved:1, available:0,
+                         percent:0, status:'Reserved',
+                         occupantName: entireRes.name || 'Reservation holder',
+                         chips:[{ kind:'res', title:'Entire room reservation' }],
+                         showResChip:true, showFreeChip:false, locked:true };
+            }
+
+            const occupied = beds.filter(b => b && (b.isOccupied || b.boarderId)).length;
+            const reserved = beds.filter(b => b && b.isReserved && !b.isOccupied).length;
+            const available = Math.max(0, capacity - occupied - reserved);
+            let status = 'Available';
+            if (capacity > 0 && available === 0 && occupied > 0) status = 'Fully Occupied';
+            else if (capacity > 0 && available === 0 && reserved > 0) status = 'Reserved';
+            else if (occupied === 0 && reserved > 0) status = 'Reserved';
+            else if (occupied + reserved > 0) status = 'Partially Occupied';
+
+            const chips = beds.slice(0, 12).map(b => ({
+                kind: (b && (b.isOccupied || b.boarderId)) ? 'occ' : (b && b.isReserved ? 'res' : 'free'),
+                title: 'Bed ' + ((b && (b.bedNo || b.number)) || '')
+            }));
+            if (beds.length > 12) chips.push({ kind:'more', label:'+' + (beds.length - 12), title:'+' + (beds.length - 12) + ' more' });
+
+            return { mode:'bed', entireRoom:false, capacity, occupied, reserved, available,
+                     percent: capacity ? Math.round((occupied / capacity) * 100) : 0, status,
+                     chips, showResChip: reserved > 0, showFreeChip: available > 0, locked:false };
+        }
+        window.getRoomOccupancy = getRoomOccupancy;
+
+        function _occChipHtml(chip) {
+            if (chip.kind === 'more') return `<span class="rc-bed" title="${chip.title}">${chip.label}</span>`;
+            const icon = chip.kind === 'occ' ? '<i class="fa-solid fa-user"></i>'
+                       : chip.kind === 'res' ? '<i class="fa-solid fa-bookmark"></i>'
+                       : '<i class="fa-regular fa-square"></i>';
+            const cls = chip.kind === 'occ' ? 'occ' : (chip.kind === 'res' ? 'res' : 'av');
+            return `<span class="rc-bed ${cls}" title="${chip.title || ''}">${icon}</span>`;
+        }
+
+        function _renderRoomCard(room, statusMeta, floorName) {
+            const isAdmin = room.type === 'Admin';
+            const o = getRoomOccupancy(room);
+            const displayStatus = isAdmin ? 'Admin' : o.status;
+            const capacity = o.capacity;
 
             const statusClass = 'room-' + (isAdmin ? 'Admin' : displayStatus.split(' ')[0]);
             const meta = statusMeta[displayStatus] || statusMeta['Available'];
-            const availCount = Math.max(0, capacity - occCount - resCount);
-            const pct = capacity ? Math.round((occCount / capacity) * 100) : 0;
 
-            // REQUEST 22-G: Entire Room Rental → visually treat as fully unavailable
-            const _isEntireLocked = !!(_entireOwner || (_mapEntireRes && _mapEntireRes.status === 'Checked-in'));
-            const _isFull = displayStatus === 'Fully Occupied' || _isEntireLocked;
-
-
-            // Bed indicators (cap at 12 chips for compactness)
-            let bedsHtml = '';
-            if (!isAdmin && room.beds && room.beds.length) {
-                if (_isEntireLocked) {
-                    // REQUEST 1: Checked-in Entire-Room reservation shows exactly ONE red occupant chip
-                    bedsHtml = `<span class="rc-bed occ" title="Occupant"><i class="fa-solid fa-user"></i></span>`;
-                } else {
-                    const beds = room.beds.slice(0, 12);
-                    beds.forEach(b => {
-                        let cls = 'av';
-                        if (b.isOccupied || b.boarderId) cls = 'occ';
-                        else if (b.isReserved) cls = 'res';
-                        bedsHtml += `<span class="rc-bed ${cls}" title="Bed">${cls==='occ'?'<i class="fa-solid fa-user"></i>':(cls==='res'?'<i class="fa-solid fa-bookmark"></i>':'<i class="fa-regular fa-square"></i>')}</span>`;
-                    });
-                    if (room.beds.length > 12) bedsHtml += `<span class="rc-bed" title="+${room.beds.length-12} more">+${room.beds.length-12}</span>`;
-                }
-            }
+            const bedsHtml = (!isAdmin && o.chips && o.chips.length) ? o.chips.map(_occChipHtml).join('') : '';
 
             if (isAdmin) {
                 return `
@@ -2046,13 +2087,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             const availableCTA = displayStatus === 'Available'
                 ? `<span class="rc-cta"><i class="fa-solid fa-plus-circle"></i> Check-In</span>` : '';
 
-            // REQUEST 22-G: For entire-room / fully occupied → hide FREE + zero-value RES chip;
-            // show entire-room banner in place of the free-bed indicator.
-            const _displayPct = _isEntireLocked ? 100 : pct;
-            const _displayOcc = _isEntireLocked ? 1 : occCount;
-            const showRes = !_isEntireLocked && resCount > 0;
-            const showFree = !_isEntireLocked && !_isFull;
-            const entireBadge = _isEntireLocked
+            const entireBadge = o.entireRoom
                 ? `<span class="ml-auto inline-flex items-center gap-1 text-[10px] font-black uppercase tracking-wider text-rose-600"><i class="fa-solid fa-lock"></i> Entire Room</span>` : '';
 
             return `
@@ -2069,15 +2104,14 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
 
                     <div class="rc-progress-wrap">
                         <div class="rc-progress-meta">
-                            <!-- REQUEST 1: hide "X of Y beds" text when room is Checked-in under an Entire Room Reservation -->
-                            ${_isEntireLocked ? '<span></span>' : `<span>${_displayOcc} of ${capacity} beds</span>`}
-                            <span>${_displayPct}%</span>
+                            ${o.entireRoom ? '<span></span>' : `<span>${o.occupied} of ${capacity} beds</span>`}
+                            <span>${o.percent}%</span>
                         </div>
-                        <div class="rc-progress"><span style="width:${_displayPct}%"></span></div>
+                        <div class="rc-progress"><span style="width:${o.percent}%"></span></div>
                         <div class="flex items-center gap-3 text-[10px] mt-1.5 font-bold uppercase tracking-wider text-slate-500">
-                            <span data-occ-chip="1"><i class="fa-solid fa-user text-red-500"></i> ${_isEntireLocked ? 1 : occCount} Occ</span>
-                            ${showRes ? `<span><i class="fa-solid fa-bookmark text-blue-500"></i> ${resCount} Res</span>` : ''}
-                            ${showFree ? `<span><i class="fa-regular fa-square text-emerald-500"></i> ${availCount} Free</span>` : ''}
+                            <span data-occ-chip="1"><i class="fa-solid fa-user text-red-500"></i> ${o.occupied} Occ</span>
+                            ${o.showResChip ? `<span><i class="fa-solid fa-bookmark text-blue-500"></i> ${o.reserved} Res</span>` : ''}
+                            ${o.showFreeChip ? `<span><i class="fa-regular fa-square text-emerald-500"></i> ${o.available} Free</span>` : ''}
                             ${entireBadge}
                         </div>
                     </div>
@@ -2087,6 +2121,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
                     </div>
                 </div>`;
         }
+
 
         function handleRoomClick(roomId) {
             const room = bhmsData.rooms.find(r => r.id == roomId);
@@ -2098,21 +2133,14 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             const room = bhmsData.rooms.find(r => r.id == roomId);
             document.getElementById('rd-room-id-hidden').value = room.id;
             document.getElementById('rd-title').innerHTML = `<i class="fa-solid fa-door-open mr-2"></i> ${room.roomName} Details`;
-            // Entire Room Reservation checked-in: counter reflects "1 OCC, 0 RES" (one reservation
-            // occupies the whole room, no bed spaces available for reservation).
-            const _rdEntireRes = getActiveEntireRoomRes(room.id);
-            const _rdEntireOwner = getEntireRoomOccupant(room);
-            if (_rdEntireOwner || (_rdEntireRes && _rdEntireRes.status === 'Checked-in')) {
-                document.getElementById('rd-stat-cap').innerText = room.capacity;
-                document.getElementById('rd-stat-occ').innerText = 1;
-                document.getElementById('rd-stat-res').innerText = 0;
-                document.getElementById('rd-stat-avail').innerText = 0;
-            } else {
-                document.getElementById('rd-stat-cap').innerText = room.capacity;
-                document.getElementById('rd-stat-occ').innerText = room.occupied;
-                document.getElementById('rd-stat-res').innerText = room.beds.filter(b=>b.isReserved).length;
-                document.getElementById('rd-stat-avail').innerText = room.capacity - room.occupied - room.beds.filter(b=>b.isReserved).length;
-            }
+            // Counters come from the SAME occupancy SSOT the map renders, so the
+            // modal can never disagree with the room card.
+            const _rdOcc = getRoomOccupancy(room);
+            document.getElementById('rd-stat-cap').innerText   = _rdOcc.capacity;
+            document.getElementById('rd-stat-occ').innerText   = _rdOcc.occupied;
+            document.getElementById('rd-stat-res').innerText   = _rdOcc.reserved;
+            document.getElementById('rd-stat-avail').innerText = _rdOcc.available;
+
             
             // REQUEST 1: Entire Room Reservation view (Active + Checked-in variants)
             const entireRes = getActiveEntireRoomRes(room.id);
@@ -5027,11 +5055,13 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
 
         function updateReceiptArchiveBadge() {
             const badge = document.getElementById('ra-badge');
-            const n = (bhmsData?.receiptArchive || []).length;
             if (!badge) return;
+            // Counts system-generated Official Receipts only — never OCR uploads.
+            const n = (typeof raAllRows === 'function') ? raAllRows().length : 0;
             if (n > 0) { badge.textContent = n; badge.classList.remove('hidden'); }
             else badge.classList.add('hidden');
         }
+
 
         function raBuildReceiptDocument(entry, c) {
             const cfg = c || (typeof rcGet==='function' ? rcGet() : {});
@@ -5050,68 +5080,136 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             return `${raSanitize(entry.receiptNo)}_${raSanitize(entry.boarderName)}_${d||'nodate'}.html`;
         }
 
+        /* ================================================================
+         * RECEIPT ARCHIVE — SYSTEM-GENERATED OFFICIAL RECEIPTS ONLY
+         * ----------------------------------------------------------------
+         * The archive shows ONLY receipts this system issued:
+         *   1. Official Receipts from the backend (/api/receipt-archive),
+         *      already normalised there so no field can be "undefined".
+         *   2. Legacy locally-archived system receipts (receiptNo + html).
+         * Uploaded GCash images / OCR records live in `bhmsData.receiptArchive`
+         * too, but they are supporting documents — they are filtered out here
+         * and belong to the OCR Review screen only.
+         * ================================================================ */
+        window.__officialReceiptRows = window.__officialReceiptRows || [];
+
+        function raIsSystemReceipt(e) {
+            if (!e || typeof e !== 'object') return false;
+            if (e.ocr || e.verificationStatus || e.adminStatus || e.imagePath) return false; // OCR upload
+            return !!(e.receiptNo && e.html);
+        }
+
+        function raDash(v) {
+            const s = (v === null || v === undefined) ? '' : String(v).trim();
+            return (s && s !== 'undefined' && s !== 'null' && s !== 'NaN') ? s : '—';
+        }
+
+        /** Normalise a legacy local entry into the same row shape as the API. */
+        function raLegacyRow(e) {
+            const amount = Number(e.amount || 0);
+            return {
+                id: e.receiptNo, orNumber: raDash(e.receiptNo), source: 'legacy',
+                orDate: e.createdAt || null,
+                orDateDisplay: raDash((e.paymentDate || e.createdAt || '').toString().slice(0, 19)),
+                boarder: raDash(e.boarderName),
+                room: raDash(e.roomName),
+                bed: e.occupancyType === 'entire_room' ? 'ENTIRE ROOM' : raDash(e.bedNo && e.bedNo !== 'Any' ? 'Bed ' + e.bedNo : ''),
+                occupancyType: e.occupancyType === 'entire_room' ? 'Entire Room' : 'Bed Space',
+                amount,
+                amountDisplay: '₱' + amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
+                paymentMethod: raDash(e.method),
+                paymentReference: raDash(e.reference),
+                details: raDash(e.details),
+                status: 'Issued',
+                roomId: e.roomId || null
+            };
+        }
+
+        /** Refresh the Official Receipt rows from the backend, then re-render. */
+        async function raLoadOfficialReceipts() {
+            try {
+                const res = await fetch('/api/receipt-archive');
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                const data = await res.json();
+                window.__officialReceiptRows = (data.receipts || []).map(r => ({ ...r, source: 'official' }));
+            } catch (err) {
+                console.error('Receipt Archive load failed:', err);
+            }
+            renderReceiptArchive();
+        }
+        window.raLoadOfficialReceipts = raLoadOfficialReceipts;
+
+        function raAllRows() {
+            const legacy = (bhmsData?.receiptArchive || []).filter(raIsSystemReceipt).map(raLegacyRow);
+            const official = window.__officialReceiptRows || [];
+            const seen = new Set(official.map(r => r.orNumber));
+            return official.concat(legacy.filter(r => !seen.has(r.orNumber)));
+        }
+
         function raGetFiltered() {
-            const list = (bhmsData?.receiptArchive || []).slice();
             const q = (document.getElementById('ra-search')?.value || '').toLowerCase().trim();
             const from = document.getElementById('ra-from')?.value;
             const to = document.getElementById('ra-to')?.value;
             const room = document.getElementById('ra-room')?.value;
-            return list.filter(e => {
+            const roomName = room
+                ? ((bhmsData?.rooms || []).find(r => String(r.id) === String(room))?.roomName || '')
+                : '';
+            return raAllRows().filter(e => {
                 if (q) {
-                    const hay = `${e.receiptNo} ${e.boarderName} ${e.roomName} ${e.details} ${e.reference}`.toLowerCase();
+                    const hay = [e.orNumber, e.boarder, e.room, e.bed, e.details, e.paymentReference, e.paymentMethod]
+                        .join(' ').toLowerCase();
                     if (!hay.includes(q)) return false;
                 }
-                const d = (e.createdAt || '').slice(0,10);
-                if (from && d < from) return false;
-                if (to && d > to) return false;
-                if (room && String(e.roomId) !== String(room)) return false;
+                const d = (e.orDate || '').toString().slice(0, 10);
+                if (from && d && d < from) return false;
+                if (to && d && d > to) return false;
+                if (room && !(String(e.roomId) === String(room) || (roomName && e.room === roomName))) return false;
                 return true;
-            }).sort((a,b) => (b.createdAt||'').localeCompare(a.createdAt||''));
+            }).sort((a, b) => String(b.orDate || '').localeCompare(String(a.orDate || '')));
         }
 
         function renderReceiptArchive() {
             const body = document.getElementById('ra-body');
             const empty = document.getElementById('ra-empty');
             if (!body) return;
-            // Populate room filter (once/refresh)
             const roomSel = document.getElementById('ra-room');
             if (roomSel && roomSel.options.length <= 1) {
                 (bhmsData?.rooms || []).forEach(r => {
-                    const o = document.createElement('option'); o.value = r.id; o.textContent = r.roomName || ('Room '+r.roomNumber);
+                    const o = document.createElement('option');
+                    o.value = r.id; o.textContent = r.roomName || ('Room ' + r.roomNumber);
                     roomSel.appendChild(o);
                 });
             }
             const list = raGetFiltered();
+            const attr = v => String(v == null ? '' : v).replace(/"/g, '&quot;');
             body.innerHTML = list.map(e => `
-                <tr class="hover:bg-gray-50">
-                    <td class="p-3 font-mono font-bold text-gray-800">${e.receiptNo}</td>
-                    <td class="p-3 text-gray-600 whitespace-nowrap">${(e.paymentDate||'').toString().slice(0,19)}</td>
-                    <td class="p-3 text-gray-800">${e.boarderName}</td>
-                    <td class="p-3 text-gray-600">${e.occupancyType === 'entire_room' ? (e.roomName + ' · ENTIRE ROOM') : (e.roomName + (e.bedNo && e.bedNo!=='Any' ? ' · Bed '+e.bedNo : ''))}</td>
-                    <td class="p-3 text-right font-bold text-emerald-700">₱${Number(e.amount).toLocaleString(undefined,{minimumFractionDigits:2})}</td>
-                    <td class="p-3 text-gray-600">${e.method||''}</td>
-                    <td class="p-3 text-gray-600 truncate max-w-[180px]" title="${(e.details||'').replace(/"/g,'&quot;')}">${e.details||''}</td>
+                <tr class="hover:bg-gray-50 ${e.status === 'Void' ? 'opacity-60' : ''}">
+                    <td class="p-3 font-mono font-bold text-gray-800">${e.orNumber}</td>
+                    <td class="p-3 text-gray-600 whitespace-nowrap">${e.orDateDisplay}</td>
+                    <td class="p-3 text-gray-800">${e.boarder}</td>
+                    <td class="p-3 text-gray-600">${e.occupancyType === 'Entire Room' ? (e.room + ' · ENTIRE ROOM') : (e.room + (e.bed && e.bed !== '—' ? ' · ' + e.bed : ''))}</td>
+                    <td class="p-3 text-right font-bold text-emerald-700">${e.amountDisplay}</td>
+                    <td class="p-3 text-gray-600">${e.paymentMethod}</td>
+                    <td class="p-3 text-gray-600 truncate max-w-[180px]" title="${attr(e.details)}">${e.details}</td>
                     <td class="p-3 text-center whitespace-nowrap">
-                        <button onclick="viewArchivedReceipt('${e.receiptNo}')" class="text-blue-600 hover:text-blue-800 mx-1" title="View / Print"><i class="fa-solid fa-eye"></i></button>
-                        <button onclick="downloadArchivedReceipt('${e.receiptNo}')" class="text-emerald-600 hover:text-emerald-800 mx-1" title="Download"><i class="fa-solid fa-download"></i></button>
-                        <button onclick="deleteArchivedReceipt('${e.receiptNo}')" class="text-red-500 hover:text-red-700 mx-1" title="Delete"><i class="fa-solid fa-trash"></i></button>
+                        <button onclick="viewArchivedReceipt('${attr(e.id)}')" class="text-blue-600 hover:text-blue-800 mx-1" title="View / Print"><i class="fa-solid fa-eye"></i></button>
+                        <button onclick="downloadArchivedReceipt('${attr(e.id)}')" class="text-emerald-600 hover:text-emerald-800 mx-1" title="Download"><i class="fa-solid fa-download"></i></button>
+                        <button onclick="deleteArchivedReceipt('${attr(e.id)}')" class="text-red-500 hover:text-red-700 mx-1" title="Delete permanently"><i class="fa-solid fa-trash"></i></button>
                     </td>
                 </tr>
             `).join('');
             if (empty) empty.classList.toggle('hidden', list.length !== 0);
 
-            // Stats
-            const all = bhmsData?.receiptArchive || [];
-            const total = all.length;
-            const totalAmt = all.reduce((s,e)=>s + Number(e.amount||0), 0);
-            const now = new Date(); const ym = now.toISOString().slice(0,7);
-            const thisMonth = all.filter(e => (e.createdAt||'').slice(0,7) === ym).length;
-            const latest = all.slice().sort((a,b)=>(b.createdAt||'').localeCompare(a.createdAt||''))[0];
-            const setTxt = (id,v) => { const el=document.getElementById(id); if(el) el.textContent = v; };
-            setTxt('ra-stat-total', total);
-            setTxt('ra-stat-amount', '₱'+totalAmt.toLocaleString(undefined,{minimumFractionDigits:2}));
+            const all = raAllRows();
+            const totalAmt = all.filter(e => e.status !== 'Void').reduce((s, e) => s + Number(e.amount || 0), 0);
+            const ym = new Date().toISOString().slice(0, 7);
+            const thisMonth = all.filter(e => String(e.orDate || '').slice(0, 7) === ym).length;
+            const latest = all[0];
+            const setTxt = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+            setTxt('ra-stat-total', all.length);
+            setTxt('ra-stat-amount', '₱' + totalAmt.toLocaleString(undefined, { minimumFractionDigits: 2 }));
             setTxt('ra-stat-month', thisMonth);
-            setTxt('ra-stat-latest', latest ? `${latest.receiptNo} · ${latest.boarderName}` : '—');
+            setTxt('ra-stat-latest', latest ? `${latest.orNumber} · ${latest.boarder}` : '—');
             updateReceiptArchiveBadge();
         }
 
@@ -5120,9 +5218,16 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             renderReceiptArchive();
         }
 
-        function viewArchivedReceipt(receiptNo) {
-            const e = (bhmsData?.receiptArchive || []).find(x => x.receiptNo === receiptNo);
-            if (!e) { showToast && showToast('Receipt not found'); return; }
+        function raFindRow(id) { return raAllRows().find(r => String(r.id) === String(id)) || null; }
+        function raFindLegacy(id) {
+            return (bhmsData?.receiptArchive || []).find(x => raIsSystemReceipt(x) && String(x.receiptNo) === String(id)) || null;
+        }
+
+        function viewArchivedReceipt(id) {
+            const row = raFindRow(id);
+            if (!row) { showToast && showToast('Receipt not found', 'error'); return; }
+            if (row.source === 'official') { window.open(row.viewUrl, '_blank'); return; }
+            const e = raFindLegacy(id);
             const w = window.open('', '_blank');
             if (!w) { alert('Please allow pop-ups to view the receipt.'); return; }
             const doc = raBuildReceiptDocument(e, rcGet());
@@ -5130,26 +5235,61 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             w.document.close();
         }
 
-        function downloadArchivedReceipt(receiptNo) {
-            const e = (bhmsData?.receiptArchive || []).find(x => x.receiptNo === receiptNo);
-            if (!e) return;
+        function downloadArchivedReceipt(id) {
+            const row = raFindRow(id);
+            if (!row) return;
+            if (row.source === 'official') { window.open(row.downloadUrl, '_blank'); return; }
+            const e = raFindLegacy(id);
             const doc = raBuildReceiptDocument(e, rcGet());
             const blob = new Blob([doc], { type: 'text/html;charset=utf-8' });
             const a = document.createElement('a');
             a.href = URL.createObjectURL(blob);
             a.download = raFilename(e);
             document.body.appendChild(a); a.click(); a.remove();
-            setTimeout(()=>URL.revokeObjectURL(a.href), 2000);
+            setTimeout(() => URL.revokeObjectURL(a.href), 2000);
         }
 
-        function deleteArchivedReceipt(receiptNo) {
-            if (!confirm(`Delete archived receipt ${receiptNo}? This cannot be undone.`)) return;
-            bhmsData.receiptArchive = (bhmsData.receiptArchive || []).filter(e => e.receiptNo !== receiptNo);
-            try { saveData(); } catch(e){}
-            try { logAudit && logAudit('Receipt', `Deleted archived receipt ${receiptNo}`); } catch(e){}
+        /**
+         * PERSISTENT DELETE. For Official Receipts the backend removes the OR and
+         * every derived Payment History / Ledger / Financial Report row, so the
+         * record stays gone after a refresh. Only after the server confirms do we
+         * update the table.
+         */
+        async function deleteArchivedReceipt(id) {
+            const row = raFindRow(id);
+            if (!row) { showToast && showToast('Receipt not found', 'error'); return; }
+            if (!confirm(`Permanently delete ${row.orNumber}?\n\nThis also removes its Payment History, Ledger and Financial Report entries. This cannot be undone.`)) return;
+
+            if (row.source === 'official') {
+                try {
+                    const res = await fetch('/api/official-receipts/' + encodeURIComponent(row.id), { method: 'DELETE' });
+                    const out = await res.json().catch(() => ({}));
+                    if (!res.ok || !out.deleted) throw new Error(out.error || ('HTTP ' + res.status));
+                    window.__officialReceiptRows = (window.__officialReceiptRows || []).filter(r => String(r.id) !== String(row.id));
+                    try { if (typeof loadData === 'function') await loadData(); } catch (_) {}
+                    renderReceiptArchive();
+                    showToast && showToast(`${row.orNumber} permanently deleted`, 'success');
+                } catch (err) {
+                    console.error(err);
+                    showToast && showToast('Delete failed: ' + err.message, 'error');
+                }
+                return;
+            }
+
+            bhmsData.receiptArchive = (bhmsData.receiptArchive || []).filter(e => String(e.receiptNo) !== String(row.id));
+            try { await saveData(); } catch (e) {}
+            try { logAudit && logAudit('Receipt', `Deleted archived receipt ${row.orNumber}`); } catch (e) {}
             renderReceiptArchive();
-            showToast && showToast('Receipt deleted from archive');
+            showToast && showToast('Receipt deleted from archive', 'success');
         }
+
+
+        /* Export helpers operate on the SAME normalised Official Receipt rows
+         * the table shows, so an export can never contain OCR rows or blanks. */
+        const RA_CSV_HEADER = ['OR No','OR Date','Boarder','Room','Bed / Occupancy','Amount','Method','Reference','Details','Status'];
+        const raCsvRow = e => [e.orNumber, e.orDateDisplay, e.boarder, e.room, e.bed, e.amount,
+                               e.paymentMethod, e.paymentReference, String(e.details).replace(/\n/g, ' '), e.status];
+        const raToCsv = rows => rows.map(r => r.map(v => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"').join(',')).join('\r\n');
 
         async function downloadAllReceiptsZip() {
             const list = raGetFiltered();
@@ -5158,21 +5298,30 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             const stamp = new Date().toISOString().slice(0,10);
             if (typeof JSZip === 'undefined') {
                 if (!confirm(`ZIP library unavailable. Download all ${list.length} receipts as individual files instead?`)) return;
-                list.forEach((e,i) => setTimeout(()=>downloadArchivedReceipt(e.receiptNo), i*120));
+                list.forEach((e,i) => setTimeout(()=>downloadArchivedReceipt(e.id), i*120));
                 return;
             }
             try {
                 const zip = new JSZip();
                 const folder = zip.folder(`receipts_${stamp}`);
-                // Index CSV
-                const csvRows = [['Receipt No','Payment Date','Archived At','Boarder','Room','Bed','Amount','Method','Reference','Details']];
-                list.forEach(e => {
-                    folder.file(raFilename(e), raBuildReceiptDocument(e, c));
-                    csvRows.push([e.receiptNo, e.paymentDate||'', e.createdAt||'', e.boarderName||'', e.roomName||'', e.bedNo||'', e.amount, e.method||'', e.reference||'', (e.details||'').replace(/\n/g,' ')]);
-                });
-                const csv = csvRows.map(r => r.map(v => '"'+String(v==null?'':v).replace(/"/g,'""')+'"').join(',')).join('\r\n');
-                folder.file('_index.csv', csv);
-                folder.file('_manifest.json', JSON.stringify({ generated: new Date().toISOString(), count: list.length, receipts: list.map(e=>({receiptNo:e.receiptNo, amount:e.amount, boarder:e.boarderName, date:e.paymentDate})) }, null, 2));
+                const csvRows = [RA_CSV_HEADER];
+                for (const e of list) {
+                    let html = '';
+                    if (e.source === 'official') {
+                        const res = await fetch(e.viewUrl);
+                        html = res.ok ? await res.text() : '<p>Official Receipt ' + e.orNumber + ' could not be exported.</p>';
+                        folder.file(raSanitize(e.orNumber) + '_' + raSanitize(e.boarder) + '.html', html);
+                    } else {
+                        const legacy = raFindLegacy(e.id);
+                        if (legacy) folder.file(raFilename(legacy), raBuildReceiptDocument(legacy, c));
+                    }
+                    csvRows.push(raCsvRow(e));
+                }
+                folder.file('_index.csv', raToCsv(csvRows));
+                folder.file('_manifest.json', JSON.stringify({
+                    generated: new Date().toISOString(), count: list.length,
+                    receipts: list.map(e => ({ orNumber: e.orNumber, amount: e.amount, boarder: e.boarder, date: e.orDate }))
+                }, null, 2));
                 const blob = await zip.generateAsync({ type: 'blob' });
                 const a = document.createElement('a');
                 a.href = URL.createObjectURL(blob);
@@ -5190,9 +5339,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
         function downloadAllReceiptsIndex() {
             const list = raGetFiltered();
             if (!list.length) { showToast && showToast('No receipts to export'); return; }
-            const rows = [['Receipt No','Payment Date','Archived At','Boarder','Room','Bed','Amount','Method','Reference','Details']];
-            list.forEach(e => rows.push([e.receiptNo, e.paymentDate||'', e.createdAt||'', e.boarderName||'', e.roomName||'', e.bedNo||'', e.amount, e.method||'', e.reference||'', (e.details||'').replace(/\n/g,' ')]));
-            const csv = rows.map(r => r.map(v => '"'+String(v==null?'':v).replace(/"/g,'""')+'"').join(',')).join('\r\n');
+            const csv = raToCsv([RA_CSV_HEADER].concat(list.map(raCsvRow)));
             const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
             const a = document.createElement('a');
             a.href = URL.createObjectURL(blob);
@@ -5200,6 +5347,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             document.body.appendChild(a); a.click(); a.remove();
             setTimeout(()=>URL.revokeObjectURL(a.href), 2000);
         }
+
 
 
 
@@ -6720,35 +6868,14 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
 
 
   /* ============================================================
-   *  5) ROOM CARD — single blue flag for Active entire-room res
+   *  5) ROOM CARD — entire-room rendering
+   *  Removed: the legacy regex post-processor that rewrote the card HTML
+   *  for Active entire-room reservations. Occupancy is now produced by the
+   *  backend SSOT (computeRoomOccupancy) and rendered verbatim by
+   *  _renderRoomCard, which already emits exactly ONE chip and the
+   *  0 OCC / 1 RES / ENTIRE ROOM counters for that case.
    * ============================================================ */
-  const _origRenderCard = window._renderRoomCard;
-  if(typeof _origRenderCard==='function'){
-    window._renderRoomCard = function(room, statusMeta, floorName){
-      let html = _origRenderCard.apply(this, arguments);
-      try{
-        // Detect Active (not-yet-checked-in) entire-room reservation on this room.
-        const activeEntire = (bhmsData.reservations||[]).find(r =>
-          String(r.roomId)===String(room.id) &&
-          r.status==='Active' &&
-          (r.type==='room' || r.occupancyType==='entire_room'));
-        if(activeEntire && !room.beds.some(b=>b.isOccupied)){
-          // Replace the individual reservation chips with ONE blue flag chip
-          const capacity = room.capacity || (room.beds ? room.beds.length : 0);
-          const singleFlag = `<div class="rc-beds" aria-label="Bed occupancy"><span class="rc-bed res" title="Entire Room Reserved"><i class="fa-solid fa-flag"></i></span></div>`;
-          html = html.replace(/<div class="rc-beds"[\s\S]*?<\/div>/, singleFlag);
-          // Fix counters strip: 0 OCC · 1 RES · 0 FREE + banner
-          html = html.replace(/<span><i class="fa-solid fa-user text-red-500"><\/i>[^<]*<\/span>[\s\S]*?<\/div>\s*<\/div>\s*<\/div>/,
-            `<span><i class="fa-solid fa-user text-red-500"></i> 0 Occ</span>
-             <span><i class="fa-solid fa-flag text-blue-500"></i> 1 Res</span>
-             <span><i class="fa-regular fa-square text-emerald-500"></i> 0 Free</span>
-             <span class="ml-auto inline-flex items-center gap-1 text-[10px] font-black uppercase tracking-wider text-blue-600"><i class="fa-solid fa-flag"></i> Entire Room</span>
-            </div></div></div>`);
-        }
-      }catch(err){ /* keep original html on any regex miss */ }
-      return html;
-    };
-  }
+
 
   /* ============================================================
    *  6) BOARDER PROFILE — show large photo
@@ -7427,19 +7554,18 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
     document.getElementById('rd-room-id-hidden').value = room.id;
     document.getElementById('rd-title').innerHTML = '<i class="fa-solid fa-door-open mr-2"></i> ' + room.roomName + ' Details';
 
-    var st = roomState(room);
-    var cap = room.capacity || room.beds.length;
-    var resCount = room.beds.filter(function(b){ return b.isReserved; }).length;
-    var occCount = room.beds.filter(function(b){ return b.isOccupied; }).length;
-
-    if(st.entireCheckedIn){ occCount = 1; resCount = 0; }
-    else if(st.entireReserved){ occCount = 0; resCount = 1; }
+    var st  = roomState(room);
+    // Counters read the occupancy SSOT (server-computed when available).
+    var occ = window.getRoomOccupancy(room);
+    var cap = occ.capacity;
+    var resCount = occ.reserved;
+    var occCount = occ.occupied;
 
     document.getElementById('rd-stat-cap').innerText  = cap;
     document.getElementById('rd-stat-occ').innerText  = occCount;
     document.getElementById('rd-stat-res').innerText  = resCount;
-    document.getElementById('rd-stat-avail').innerText = (st.entireCheckedIn || st.entireReserved)
-      ? 0 : Math.max(0, cap - occCount - resCount);
+    document.getElementById('rd-stat-avail').innerText = occ.available;
+
 
     var subtitle = document.getElementById('rd-subtitle');
     if(subtitle){
@@ -8533,10 +8659,23 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
   #adm-chat-fab{ position:fixed; right:22px; bottom:22px; z-index:9990; width:58px; height:58px; border-radius:50%; border:none; cursor:pointer;
     background:var(--wl-primary,#1d4ed8); color:#fff; font-size:1.3rem; box-shadow:0 18px 42px -14px rgba(0,0,0,.55); display:grid; place-items:center; }
   #adm-chat-fab .b{ position:absolute; top:-4px; right:-4px; min-width:22px; height:22px; padding:0 6px; border-radius:11px; background:#ef4444; color:#fff; font-size:.68rem; font-weight:800; display:none; place-items:center; }
-  #adm-chat{ position:fixed; right:22px; bottom:22px; z-index:9991; width:min(96vw,820px); height:min(84vh,660px); background:#fff; border-radius:18px; overflow:hidden;
+  /* Draggable · resizable · minimizable messenger window */
+  #adm-chat{ position:fixed; right:22px; bottom:22px; z-index:9991; width:min(96vw,820px); height:min(84vh,660px); min-width:420px; min-height:260px; max-width:98vw; max-height:96vh; background:#fff; border-radius:18px; overflow:hidden;
     box-shadow:0 34px 90px -24px rgba(0,0,0,.55); display:none; grid-template-columns:290px 1fr; }
   #adm-chat.open{ display:grid; }
-  @media (max-width:760px){ #adm-chat{ grid-template-columns:1fr; } #adm-chat.open #adm-chat-list{ display:none; } #adm-chat.open.list #adm-chat-list{ display:flex; } #adm-chat.open.list #adm-chat-main{ display:none; } }
+  #adm-chat.dragging{ user-select:none; }
+  #adm-chat.minimized{ grid-template-columns:1fr; height:auto !important; min-height:0; min-width:320px; }
+  #adm-chat.minimized #adm-chat-list,
+  #adm-chat.minimized #adm-chat-body,
+  #adm-chat.minimized #adm-chat-foot,
+  #adm-chat.minimized #adm-chat-resize{ display:none !important; }
+  #adm-chat-head, #adm-chat-list header{ cursor:grab; touch-action:none; }
+  #adm-chat-head:active, #adm-chat-list header:active{ cursor:grabbing; }
+  #adm-chat-head button, #adm-chat-head input, #adm-chat-list header button, #adm-chat-list header input{ cursor:auto; }
+  #adm-chat-head button, #adm-chat-list header button{ cursor:pointer; }
+  #adm-chat-resize{ position:absolute; right:3px; bottom:3px; width:18px; height:18px; cursor:nwse-resize; color:#94a3b8; display:grid; place-items:center; font-size:.6rem; z-index:5; }
+  @media (max-width:760px){ #adm-chat{ grid-template-columns:1fr; min-width:0; } #adm-chat.open #adm-chat-list{ display:none; } #adm-chat.open.list #adm-chat-list{ display:flex; } #adm-chat.open.list #adm-chat-main{ display:none; } }
+
   #adm-chat-list{ border-right:1px solid #e2e8f0; display:flex; flex-direction:column; background:#f8fafc; }
   #adm-chat-list header{ padding:.85rem; border-bottom:1px solid #e2e8f0; background:var(--wl-secondary,#0f172a); color:#fff; }
   #adm-chat-threads{ flex:1; overflow-y:auto; }
@@ -8590,7 +8729,9 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
         <div id="adm-chat-name" class="font-black text-sm text-slate-900 truncate">Select a conversation</div>
         <div id="adm-chat-meta" class="text-[11px] text-slate-500 truncate"></div>
       </div>
+      <button id="adm-chat-min" class="text-slate-400 hover:text-slate-700 px-2" title="Minimize"><i class="fa-solid fa-minus"></i></button>
       <button id="adm-chat-x" class="text-slate-400 hover:text-slate-700 px-2"><i class="fa-solid fa-xmark"></i></button>
+
     </div>
     <div id="adm-chat-body"><div class="m-auto text-slate-400 text-sm">No conversation selected.</div></div>
     <div id="adm-chat-foot">
@@ -8601,7 +8742,9 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
       <button id="adm-chat-send" class="text-white px-3 py-2 rounded-lg" style="background:var(--wl-primary,#1d4ed8)"><i class="fa-solid fa-paper-plane"></i></button>
     </div>
   </section>
+  <div id="adm-chat-resize" title="Drag to resize"><i class="fa-solid fa-up-right-and-down-left-from-center fa-rotate-90"></i></div>
 </div>
+
 <div id="adm-chat-lb"><img alt="Receipt"></div>
 
 <script>
@@ -8808,11 +8951,116 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
   el('adm-chat-lb').onclick = () => el('adm-chat-lb').classList.remove('open');
   el('adm-chat-back').onclick = () => el('adm-chat').classList.add('list');
 
-  function open(){ S.open = true; el('adm-chat').classList.add('open'); el('adm-chat-fab').style.display = 'none'; refreshThreads(); loadMessages(true); }
-  function close(){ S.open = false; el('adm-chat').classList.remove('open'); el('adm-chat-fab').style.display = 'grid'; }
+  /* ===================================================================
+   * WINDOW UX — draggable, resizable and minimizable messenger window.
+   * Geometry persists in localStorage and is clamped to the viewport on
+   * open and on window resize so the window is never lost off-screen.
+   * =================================================================== */
+  const GEO_KEY = 'mdms.adminChat.geometry';
+  const geoLoad = () => { try { return JSON.parse(localStorage.getItem(GEO_KEY) || 'null'); } catch(_){ return null; } };
+  const geoSave = g => { try { localStorage.setItem(GEO_KEY, JSON.stringify(g)); } catch(_){} };
+
+  function applyGeometry(){
+    const p = el('adm-chat'); const g = geoLoad(); if (!g) return;
+    const minW = p.classList.contains('minimized') ? 320 : 420;
+    const w = Math.min(Math.max(g.w || p.offsetWidth, minW), window.innerWidth - 16);
+    const h = Math.min(Math.max(g.h || p.offsetHeight, 260), window.innerHeight - 16);
+    p.style.width = w + 'px';
+    if (!p.classList.contains('minimized')) p.style.height = h + 'px';
+    const left = Math.min(Math.max(g.left != null ? g.left : (window.innerWidth - w - 22), 8), Math.max(8, window.innerWidth - w - 8));
+    const top  = Math.min(Math.max(g.top  != null ? g.top  : (window.innerHeight - h - 22), 8), Math.max(8, window.innerHeight - p.offsetHeight - 8));
+    p.style.left = left + 'px'; p.style.top = top + 'px';
+    p.style.right = 'auto'; p.style.bottom = 'auto';
+  }
+  function storeGeometry(){
+    const p = el('adm-chat'); const r = p.getBoundingClientRect(); const prev = geoLoad() || {};
+    geoSave({ left:r.left, top:r.top, w:r.width,
+      h: p.classList.contains('minimized') ? (prev.h || 660) : r.height,
+      minimized: p.classList.contains('minimized') });
+  }
+  function setMinimized(min){
+    const p = el('adm-chat'); const btn = el('adm-chat-min');
+    const g = geoLoad() || {};
+    if (min){
+      g.h = p.getBoundingClientRect().height; g.minimized = true; geoSave(g);
+      p.classList.add('minimized'); p.style.height = 'auto';
+      if (btn){ btn.innerHTML = '<i class="fa-solid fa-window-maximize"></i>'; btn.title = 'Restore'; }
+    } else {
+      g.minimized = false; geoSave(g);
+      p.classList.remove('minimized');
+      p.style.height = Math.min(Math.max(g.h || 660, 260), window.innerHeight - 16) + 'px';
+      if (btn){ btn.innerHTML = '<i class="fa-solid fa-minus"></i>'; btn.title = 'Minimize'; }
+    }
+    applyGeometry();
+    storeGeometry();
+    if (!min){ const b = el('adm-chat-body'); if (b) b.scrollTop = b.scrollHeight; }
+  }
+  function initWindowUX(){
+    const p = el('adm-chat'); if (!p || p.dataset.uxReady) return;
+    p.dataset.uxReady = '1';
+    const handles = [el('adm-chat-head'), el('adm-chat-list') && el('adm-chat-list').querySelector('header')].filter(Boolean);
+    const grip = el('adm-chat-resize');
+    let mode = null, sx = 0, sy = 0, ox = 0, oy = 0, ow = 0, oh = 0;
+
+    const start = (m, e) => {
+      if (m === 'move' && e.target.closest('button, input, textarea, a, label')) return;
+      const r = p.getBoundingClientRect();
+      p.style.left = r.left + 'px'; p.style.top = r.top + 'px';
+      p.style.right = 'auto'; p.style.bottom = 'auto';
+      mode = m; sx = e.clientX; sy = e.clientY; ox = r.left; oy = r.top; ow = r.width; oh = r.height;
+      p.classList.add('dragging');
+      p.setPointerCapture && p.setPointerCapture(e.pointerId);
+      e.preventDefault();
+    };
+    const move = e => {
+      if (!mode) return;
+      const dx = e.clientX - sx, dy = e.clientY - sy;
+      if (mode === 'move'){
+        const w = p.offsetWidth, h = p.offsetHeight;
+        p.style.left = Math.min(Math.max(ox + dx, 8), Math.max(8, window.innerWidth  - w - 8)) + 'px';
+        p.style.top  = Math.min(Math.max(oy + dy, 8), Math.max(8, window.innerHeight - h - 8)) + 'px';
+      } else {
+        p.style.width  = Math.min(Math.max(ow + dx, 420), window.innerWidth  - ox - 8) + 'px';
+        p.style.height = Math.min(Math.max(oh + dy, 260), window.innerHeight - oy - 8) + 'px';
+      }
+    };
+    const end = e => {
+      if (!mode) return;
+      mode = null; p.classList.remove('dragging');
+      if (p.releasePointerCapture && e.pointerId != null) { try { p.releasePointerCapture(e.pointerId); } catch(_){} }
+      storeGeometry();
+    };
+
+    handles.forEach(h => {
+      h.addEventListener('pointerdown', e => start('move', e));
+      h.addEventListener('dblclick', e => {
+        if (e.target.closest('button, input, textarea, a, label')) return;
+        setMinimized(!p.classList.contains('minimized'));
+      });
+    });
+    if (grip) grip.addEventListener('pointerdown', e => start('resize', e));
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', end);
+    window.addEventListener('pointercancel', end);
+    window.addEventListener('resize', () => { if (S.open) applyGeometry(); });
+  }
+
+  function open(){
+    S.open = true;
+    el('adm-chat').classList.add('open');
+    el('adm-chat-fab').style.display = 'none';
+    initWindowUX();
+    const g = geoLoad();
+    setMinimized(!!(g && g.minimized));
+    applyGeometry();
+    refreshThreads(); loadMessages(true);
+  }
+  function close(){ S.open = false; storeGeometry(); el('adm-chat').classList.remove('open'); el('adm-chat-fab').style.display = 'grid'; }
   el('adm-chat-fab').onclick = open;
   el('adm-chat-x').onclick = close;
   el('adm-chat-x2').onclick = close;
+  el('adm-chat-min').onclick = () => setMinimized(!el('adm-chat').classList.contains('minimized'));
+
 
   window.AdminChat = { open, close, refresh: refreshThreads, openReservation(resId){
     open();
