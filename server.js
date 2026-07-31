@@ -389,6 +389,173 @@ const DEFAULT_SETTINGS = {
  *     checkout) is fully released: beds cleared, occupied = 0,
  *     payerId = null, reservation lock cleared, status = "Available".
  * ==================================================================== */
+/* ====================================================================
+ * RESERVATION LIFECYCLE — SINGLE SOURCE OF TRUTH (SSOT)
+ * --------------------------------------------------------------------
+ * ONE definition of a reservation's lifecycle for the Tenant Portal,
+ * the Admin Portal and every API. A reservation created by
+ * Tenant_index.html and a reservation created directly by the Admin
+ * Portal are normalised into the SAME canonical record, so Room Details,
+ * Reservation Cards, Reservation Logs, the Dormitory Map, Check-In and
+ * Cancel all read identical values.
+ *
+ * Canonical statuses (the ONLY values persisted):
+ *   Pending  -> submitted, awaiting Admin approval
+ *   Active   -> approved / paid-verified, may be Checked-In or Cancelled
+ *   Checked-in -> converted into an Active Boarder
+ *   Cancelled | Expired | Rejected | Completed -> terminal
+ * ==================================================================== */
+const RESERVATION_STATUS = {
+    PENDING: 'Pending', ACTIVE: 'Active', CHECKED_IN: 'Checked-in',
+    CANCELLED: 'Cancelled', EXPIRED: 'Expired', REJECTED: 'Rejected', COMPLETED: 'Completed'
+};
+/* Every legacy / portal-specific alias collapses into a canonical status. */
+const RESERVATION_STATUS_ALIASES = {
+    'active': RESERVATION_STATUS.ACTIVE,
+    'approved': RESERVATION_STATUS.ACTIVE,
+    'confirmed': RESERVATION_STATUS.ACTIVE,
+    'reserved': RESERVATION_STATUS.ACTIVE,
+    'verified': RESERVATION_STATUS.ACTIVE,
+    'paid': RESERVATION_STATUS.ACTIVE,
+    'payment verified': RESERVATION_STATUS.ACTIVE,
+    'approved - active': RESERVATION_STATUS.ACTIVE,
+    'pending': RESERVATION_STATUS.PENDING,
+    'pending approval': RESERVATION_STATUS.PENDING,
+    'pending admin approval': RESERVATION_STATUS.PENDING,
+    'pending verification': RESERVATION_STATUS.PENDING,
+    'awaiting approval': RESERVATION_STATUS.PENDING,
+    'awaiting review': RESERVATION_STATUS.PENDING,
+    'submitted': RESERVATION_STATUS.PENDING,
+    'for approval': RESERVATION_STATUS.PENDING,
+    'checked-in': RESERVATION_STATUS.CHECKED_IN,
+    'checked in': RESERVATION_STATUS.CHECKED_IN,
+    'checkedin': RESERVATION_STATUS.CHECKED_IN,
+    'cancelled': RESERVATION_STATUS.CANCELLED,
+    'canceled': RESERVATION_STATUS.CANCELLED,
+    'expired': RESERVATION_STATUS.EXPIRED,
+    'rejected': RESERVATION_STATUS.REJECTED,
+    'declined': RESERVATION_STATUS.REJECTED,
+    'completed': RESERVATION_STATUS.COMPLETED,
+    'checked-out': RESERVATION_STATUS.COMPLETED,
+    'void': RESERVATION_STATUS.CANCELLED
+};
+const RESERVATION_TERMINAL_STATUSES = [
+    RESERVATION_STATUS.CANCELLED, RESERVATION_STATUS.EXPIRED,
+    RESERVATION_STATUS.REJECTED, RESERVATION_STATUS.COMPLETED
+];
+
+function canonicalReservationStatus(r) {
+    if (!r) return RESERVATION_STATUS.PENDING;
+    const raw = String(r.status == null ? '' : r.status).trim().toLowerCase();
+    let canon = RESERVATION_STATUS_ALIASES[raw];
+    if (!canon) {
+        // Unknown label: fall back to the approval / payment signals.
+        const appr = String(r.approvalStatus || '').trim().toLowerCase();
+        if (appr === 'approved') canon = RESERVATION_STATUS.ACTIVE;
+        else if (appr === 'rejected') canon = RESERVATION_STATUS.REJECTED;
+        else canon = RESERVATION_STATUS.PENDING;
+    }
+    // An approved reservation can never be displayed as Pending anywhere.
+    if (canon === RESERVATION_STATUS.PENDING &&
+        (String(r.approvalStatus || '').toLowerCase() === 'approved' ||
+         r.approved === true || r.paymentVerified === true)) {
+        canon = RESERVATION_STATUS.ACTIVE;
+    }
+    if (r.checkedIn === true || r.checkInStatus === 'Checked-in') canon = RESERVATION_STATUS.CHECKED_IN;
+    return canon;
+}
+
+/** THE definition of "active reservation" used by UI, APIs and Check-In. */
+function isReservationActive(r) { return canonicalReservationStatus(r) === RESERVATION_STATUS.ACTIVE; }
+function isReservationCheckedIn(r) { return canonicalReservationStatus(r) === RESERVATION_STATUS.CHECKED_IN; }
+function isReservationLive(r) { return isReservationActive(r) || isReservationCheckedIn(r); }
+function isEntireRoomReservation(r) {
+    return !!r && (r.type === 'room' || r.occupancyType === 'entire_room' ||
+                   r.reservationType === 'Entire Room' || r.scope === 'room');
+}
+
+/**
+ * Normalise EVERY reservation record — regardless of origin (Tenant Portal,
+ * Admin Portal, legacy data) — into one identical structure. Runs on every
+ * read and every write, so no portal can persist a divergent shape.
+ */
+function normalizeReservationLifecycle(v) {
+    if (!Array.isArray(v.reservations)) { v.reservations = []; return v; }
+    const nowIso = new Date().toISOString();
+    v.reservations.forEach(r => {
+        if (!r || typeof r !== 'object') return;
+
+        // --- identity / origin -----------------------------------------
+        r.id = r.id || ('RES-' + Date.now() + '-' + Math.floor(Math.random() * 1000));
+        r.source = r.source || 'admin-portal';
+        r.roomId = r.roomId != null ? r.roomId : (r.room != null ? r.room : null);
+
+        // --- occupancy type (entire room vs bed space) -----------------
+        const entire = isEntireRoomReservation(r);
+        r.type = entire ? 'room' : (r.type || 'bed');
+        r.occupancyType = entire ? 'entire_room' : 'bed';
+        r.reservationType = entire ? 'Entire Room' : 'Bed Space';
+        r.scope = entire ? 'room' : 'bed';
+        if (entire) r.bedNo = null;
+
+        // --- lifecycle --------------------------------------------------
+        const canon = canonicalReservationStatus(r);
+        r.status = canon;
+        r.approvalStatus = canon === RESERVATION_STATUS.PENDING ? 'Pending'
+            : canon === RESERVATION_STATUS.REJECTED ? 'Rejected'
+            : RESERVATION_TERMINAL_STATUSES.includes(canon) ? (r.approvalStatus || 'Approved')
+            : 'Approved';
+        r.approved = r.approvalStatus === 'Approved';
+        r.isActive = canon === RESERVATION_STATUS.ACTIVE;
+        r.active = r.isActive;                    // legacy flag kept in sync
+        r.checkedIn = canon === RESERVATION_STATUS.CHECKED_IN;
+        r.checkInStatus = r.checkedIn ? 'Checked-in' : 'Not Checked-in';
+        r.lifecycleStage = canon === RESERVATION_STATUS.PENDING ? 'Pending Approval'
+            : canon === RESERVATION_STATUS.ACTIVE ? 'Active Reservation'
+            : canon === RESERVATION_STATUS.CHECKED_IN ? 'Active Boarder'
+            : canon;
+        r.canCheckIn = r.isActive;
+        r.canCancel = r.isActive || canon === RESERVATION_STATUS.PENDING;
+
+        // --- payer / payment -------------------------------------------
+        r.payerId = r.payerId || r.boarderId || null;
+        r.boarderId = r.boarderId || (r.checkedIn ? r.payerId : null) || null;
+        r.paymentMethod = r.paymentMethod || r.method || 'GCash';
+        r.method = r.paymentMethod;
+        r.paymentReference = r.paymentReference || r.reference || '';
+        r.reference = r.paymentReference;
+        r.paymentStatus = r.paymentStatus ||
+            (r.isActive || r.checkedIn ? 'Paid' : 'Pending Verification');
+        r.reservationCredit = Number(r.reservationCredit || r.deposit || 0);
+
+        // --- timestamps / expiration ------------------------------------
+        r.createdAt = r.createdAt || r.date || nowIso;
+        r.expDate = r.expDate || r.expiryDate || '';
+        r.expTime = r.expTime || '';
+        r.expiryDate = r.expDate;
+        r.lastStatusChangeAt = r.lastStatusChangeAt || r.createdAt;
+    });
+    return v;
+}
+
+/** Backend gate used by the Check-In API and mirrored by both portals. */
+function reservationCheckInEligibility(db, reservationId) {
+    const list = Array.isArray(db.reservations) ? db.reservations : [];
+    const r = list.find(x => x && String(x.id) === String(reservationId));
+    if (!r) return { ok: false, code: 'NOT_FOUND', reason: 'Reservation not found.' };
+    const canon = canonicalReservationStatus(r);
+    if (canon === RESERVATION_STATUS.CHECKED_IN) {
+        return { ok: false, code: 'ALREADY_CHECKED_IN', reason: 'This reservation is already checked in.', reservation: r };
+    }
+    if (canon === RESERVATION_STATUS.PENDING) {
+        return { ok: false, code: 'PENDING_APPROVAL', reason: 'This reservation is still awaiting Admin approval.', reservation: r };
+    }
+    if (canon !== RESERVATION_STATUS.ACTIVE) {
+        return { ok: false, code: 'INACTIVE', reason: 'This reservation is ' + canon.toLowerCase() + '.', reservation: r };
+    }
+    return { ok: true, code: 'ELIGIBLE', reason: '', reservation: r };
+}
+
 function reconcileEntireRoomState(v) {
     if (!Array.isArray(v.rooms)) return v;
     const boarders = Array.isArray(v.boarders) ? v.boarders : [];
@@ -423,7 +590,7 @@ function reconcileEntireRoomState(v) {
             // record must follow so the UI renders the ENTIRE ROOM view).
             const ownerRecords = reservations.filter(r =>
                 r && r.type === 'room' &&
-                (r.status === 'Active' || r.status === 'Checked-in') &&
+                isReservationLive(r) &&
                 ((r.boarderId && r.boarderId === owner.id) ||
                  (!!r.name && String(r.name).trim().toLowerCase() === String(owner.name || '').trim().toLowerCase())));
             let current = ownerRecords.find(r => String(r.roomId) === String(room.id));
@@ -477,7 +644,7 @@ function reconcileEntireRoomState(v) {
             room.occupancyType = null;
             reservations.forEach(r => {
                 if (String(r.roomId) === String(room.id) && r.type === 'room' &&
-                    (r.status === 'Active' || r.status === 'Checked-in') &&
+                    isReservationLive(r) &&
                     !roomBoarders.length) {
                     r.status = 'Completed';
                 }
@@ -490,8 +657,8 @@ function reconcileEntireRoomState(v) {
         if (occ === 0 && res === 0) {
             room.payerId = null;
             const activeRes = reservations.find(r => String(r.roomId) === String(room.id) &&
-                r.type === 'room' && (r.status === 'Active' || r.status === 'Checked-in'));
-            room.status = activeRes ? (activeRes.status === 'Checked-in' ? 'Fully Occupied' : 'Reserved') : 'Available';
+                r.type === 'room' && isReservationLive(r));
+            room.status = activeRes ? (isReservationCheckedIn(activeRes) ? 'Fully Occupied' : 'Reserved') : 'Available';
         } else if (occ + res < (room.capacity || room.beds.length)) {
             room.status = 'Partially Occupied';
         } else {
@@ -513,7 +680,7 @@ function reconcileEntireRoomState(v) {
  *   Entire Room + Reserved    -> 0 OCC  / 1 RES  / ENTIRE ROOM
  *   Bed Space                 -> unchanged, real per-bed counts
  * ==================================================================== */
-const ENTIRE_ROOM_ACTIVE_STATUSES = ['Active', 'Reserved', 'Pending', 'Approved'];
+const ENTIRE_ROOM_ACTIVE_STATUSES = [RESERVATION_STATUS.ACTIVE, RESERVATION_STATUS.PENDING];
 
 function findEntireRoomOwner(db, room) {
     const boarders = Array.isArray(db.boarders) ? db.boarders : [];
@@ -538,8 +705,8 @@ function findEntireRoomReservation(db, room) {
     const candidates = reservations.filter(r => isEntireRoomReservationRecord(r, room) &&
         !ENTIRE_ROOM_DEAD_STATUSES.includes(String(r.status)));
     // Priority: a checked-in whole-room reservation always wins over a pending one.
-    return candidates.find(r => r.status === 'Checked-in') ||
-           candidates.find(r => ENTIRE_ROOM_ACTIVE_STATUSES.includes(String(r.status))) ||
+    return candidates.find(r => isReservationCheckedIn(r)) ||
+           candidates.find(r => isReservationActive(r) || canonicalReservationStatus(r) === RESERVATION_STATUS.PENDING) ||
            candidates[0] || null;
 }
 
@@ -549,7 +716,14 @@ function reservationSummary(r) {
     return {
         id: r.id, name: r.name || r.tenantName || 'Reservation holder',
         email: r.email || '', contact: r.contact || r.phone || '',
-        status: r.status || 'Active',
+        status: canonicalReservationStatus(r),
+        approvalStatus: r.approvalStatus || 'Approved',
+        isActive: isReservationActive(r),
+        checkedIn: isReservationCheckedIn(r),
+        lifecycleStage: r.lifecycleStage || '',
+        canCheckIn: isReservationActive(r),
+        canCancel: isReservationActive(r) || canonicalReservationStatus(r) === RESERVATION_STATUS.PENDING,
+        source: r.source || 'admin-portal',
         type: 'Entire Room',
         expDate: r.expDate || r.expiryDate || '',
         expTime: r.expTime || '',
@@ -589,7 +763,7 @@ function computeRoomOccupancy(db, room) {
     const beds = Array.isArray(room.beds) ? room.beds : [];
     const owner = findEntireRoomOwner(db, room);
     const entireRes = findEntireRoomReservation(db, room);
-    const checkedIn = !!owner || !!(entireRes && entireRes.status === 'Checked-in');
+    const checkedIn = !!owner || !!(entireRes && isReservationCheckedIn(entireRes));
     const reservedWhole = !checkedIn && !!entireRes;
 
     /* ---- Case A: Entire Room, checked-in -> exactly ONE occupant ---- */
@@ -792,6 +966,10 @@ function normalizeStructure(data) {
     // to run on every read/write and is fully backward compatible.
     // ==================================================================
     normalizeFloors(v);
+
+    // SSOT: every reservation (Tenant Portal or Admin Portal) is normalised
+    // into ONE canonical lifecycle shape on every read and every write.
+    normalizeReservationLifecycle(v);
 
     // FINAL FIX: entire-room ownership is reconciled on every read/write so
     // a refreshed browser always sees the same state the transfer produced.
@@ -2248,7 +2426,7 @@ function v40ActiveEntireRes(db, roomId, ignoreId) {
         String(r.roomId) === String(roomId) &&
         r.id !== ignoreId &&
         (r.type === 'room' || r.occupancyType === 'entire_room') &&
-        (r.status === 'Active' || r.status === 'Checked-in')) || null;
+        isReservationLive(r)) || null;
 }
 function v40ActiveBedRes(db, roomId, bedNo, ignoreId) {
     return (db.reservations || []).find(r =>
@@ -2256,7 +2434,7 @@ function v40ActiveBedRes(db, roomId, bedNo, ignoreId) {
         r.id !== ignoreId &&
         (r.type === 'bed' || r.occupancyType === 'bed') &&
         (bedNo === undefined || String(r.bedNo) === String(bedNo)) &&
-        (r.status === 'Active' || r.status === 'Checked-in')) || null;
+        isReservationLive(r)) || null;
 }
 
 /* Validates every NEWLY added reservation against the prior state.
@@ -2806,6 +2984,7 @@ app.post('/api/data', (req, res) => {
 
         // FINAL FIX: reconcile entire-room ownership before persisting so a
         // transferred-away room can never be written back as occupied.
+        normalizeReservationLifecycle(merged);
         reconcileEntireRoomState(merged);
 
         /* SYSTEM-WIDE OFFICIAL RECEIPT AUTOMATION.
@@ -2820,6 +2999,105 @@ app.post('/api/data', (req, res) => {
         res.status(200).json({ success: true, message: 'Data synced.', officialReceipts: issued });
 
     } catch (e) { res.status(500).json({ error: 'Sync failure.', details: e.message }); }
+});
+
+
+/* ====================================================================
+ * RESERVATION LIFECYCLE API — the backend is the SSOT. Both portals call
+ * these endpoints instead of deciding locally what "active" means.
+ * ==================================================================== */
+app.get('/api/reservations', (req, res) => {
+    const db = readStorage();
+    res.json({ reservations: (db.reservations || []).map(r => Object.assign({}, r, {
+        status: canonicalReservationStatus(r),
+        isActive: isReservationActive(r),
+        checkedIn: isReservationCheckedIn(r)
+    })) });
+});
+
+app.get('/api/reservations/:id', (req, res) => {
+    const db = readStorage();
+    const r = (db.reservations || []).find(x => String(x.id) === String(req.params.id));
+    if (!r) return res.status(404).json({ error: 'Reservation not found.' });
+    res.json({ reservation: r });
+});
+
+/** Authoritative Check-In gate. The Admin Portal must consult this. */
+app.get('/api/reservations/:id/check-in-eligibility', (req, res) => {
+    const db = readStorage();
+    res.json(reservationCheckInEligibility(db, req.params.id));
+});
+
+/** Approve a reservation -> canonical ACTIVE (Check-In + Cancel enabled). */
+app.post('/api/reservations/:id/approve', (req, res) => {
+    try {
+        const db = readStorage();
+        const r = (db.reservations || []).find(x => String(x.id) === String(req.params.id));
+        if (!r) return res.status(404).json({ error: 'Reservation not found.' });
+        const canon = canonicalReservationStatus(r);
+        if (RESERVATION_TERMINAL_STATUSES.includes(canon)) {
+            return res.status(400).json({ error: 'Reservation is ' + canon.toLowerCase() + ' and cannot be approved.' });
+        }
+        r.status = RESERVATION_STATUS.ACTIVE;
+        r.approvalStatus = 'Approved';
+        r.approvedBy = (req.mdmsUser && req.mdmsUser.name) || (req.body && req.body.approvedBy) || 'Administrator';
+        r.approvedAt = new Date().toISOString();
+        r.lastStatusChangeAt = r.approvedAt;
+        normalizeReservationLifecycle(db);
+        writeStorageAtomic(db);
+        res.json({ success: true, reservation: r });
+    } catch (e) { res.status(500).json({ error: 'Approval failure.', details: e.message }); }
+});
+
+/** Cancel a reservation (Pending or Active) and release the held bed(s). */
+app.post('/api/reservations/:id/cancel', (req, res) => {
+    try {
+        const db = readStorage();
+        const r = (db.reservations || []).find(x => String(x.id) === String(req.params.id));
+        if (!r) return res.status(404).json({ error: 'Reservation not found.' });
+        const canon = canonicalReservationStatus(r);
+        if (canon === RESERVATION_STATUS.CHECKED_IN) {
+            return res.status(400).json({ error: 'Reservation is already checked in — use check-out instead.' });
+        }
+        if (RESERVATION_TERMINAL_STATUSES.includes(canon)) {
+            return res.status(400).json({ error: 'Reservation is already ' + canon.toLowerCase() + '.' });
+        }
+        r.status = RESERVATION_STATUS.CANCELLED;
+        r.cancelReason = (req.body && (req.body.reason || req.body.cancelReason)) || 'Cancelled by Administrator';
+        r.cancelledBy = (req.mdmsUser && req.mdmsUser.name) || 'Administrator';
+        r.cancelledAt = new Date().toISOString();
+        r.lastStatusChangeAt = r.cancelledAt;
+        const room = (db.rooms || []).find(x => String(x.id) === String(r.roomId));
+        if (room && Array.isArray(room.beds)) {
+            room.beds.forEach(b => {
+                if (String(b.reservationId) === String(r.id)) { b.isReserved = false; b.reservationId = null; }
+            });
+        }
+        normalizeReservationLifecycle(db);
+        reconcileEntireRoomState(db);
+        writeStorageAtomic(db);
+        res.json({ success: true, reservation: r });
+    } catch (e) { res.status(500).json({ error: 'Cancellation failure.', details: e.message }); }
+});
+
+/** Mark a reservation checked in — validated against the SAME record. */
+app.post('/api/reservations/:id/check-in', (req, res) => {
+    try {
+        const db = readStorage();
+        const gate = reservationCheckInEligibility(db, req.params.id);
+        if (!gate.ok) return res.status(gate.code === 'NOT_FOUND' ? 404 : 400).json(gate);
+        const r = gate.reservation;
+        r.status = RESERVATION_STATUS.CHECKED_IN;
+        r.checkedIn = true;
+        r.checkInStatus = 'Checked-in';
+        r.checkedInAt = new Date().toISOString();
+        r.lastStatusChangeAt = r.checkedInAt;
+        if (req.body && req.body.boarderId) { r.boarderId = req.body.boarderId; r.payerId = req.body.boarderId; }
+        normalizeReservationLifecycle(db);
+        reconcileEntireRoomState(db);
+        writeStorageAtomic(db);
+        res.json({ success: true, reservation: r });
+    } catch (e) { res.status(500).json({ error: 'Check-in failure.', details: e.message }); }
 });
 
 /* ====================================================================
@@ -4299,8 +4577,18 @@ app.post('/api/receipts/:id/decision', (req, res) => {
              * financial report logging, tenant credit and the Official Receipt
              * email all follow the single approval action. */
             if (reservation) {
-                reservation.status = 'Approved';
+                /* SSOT: approval makes the reservation ACTIVE. Writing
+                 * 'Approved' here was what made Tenant-Portal reservations
+                 * fail the Check-In gate ("no longer active"). */
+                reservation.status = RESERVATION_STATUS.ACTIVE;
                 reservation.approvalStatus = 'Approved';
+                reservation.approved = true;
+                reservation.isActive = true;
+                reservation.active = true;
+                reservation.checkInStatus = 'Not Checked-in';
+                reservation.lifecycleStage = 'Active Reservation';
+                reservation.canCheckIn = true;
+                reservation.canCancel = true;
                 reservation.paymentStatus = 'Paid';
                 reservation.paymentVerified = true;
                 reservation.ocrStatus = rcp.verificationStatus;
