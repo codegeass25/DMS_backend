@@ -335,6 +335,10 @@ window.wlResolveAvatar = function(value, name){
 #mdms-login input:focus{outline:none;border-color:#3b82f6;box-shadow:0 0 0 3px rgba(59,130,246,.25)}
 #mdms-login .btn-primary{width:100%;background:linear-gradient(135deg,#3b82f6,#2563eb);color:#fff;font-weight:800;padding:.8rem;border-radius:10px;letter-spacing:.04em;transition:transform .15s,box-shadow .2s;box-shadow:0 10px 24px -8px rgba(59,130,246,.6)}
 #mdms-login .btn-primary:hover{transform:translateY(-1px);box-shadow:0 16px 30px -8px rgba(59,130,246,.7)}
+#mdms-login .btn-guest{width:100%;margin-top:.6rem;background:rgba(15,23,42,.6);border:1px solid rgba(148,163,184,.35);color:#e2e8f0;font-weight:700;padding:.75rem;border-radius:10px;letter-spacing:.04em;transition:border-color .2s,background .2s,transform .15s}
+#mdms-login .btn-guest:hover{background:rgba(30,41,59,.85);border-color:#3b82f6;transform:translateY(-1px)}
+#mdms-login .divider{display:flex;align-items:center;gap:.6rem;margin:1rem 0 .2rem;color:#64748b;font-size:.68rem;letter-spacing:.14em;text-transform:uppercase}
+#mdms-login .divider::before,#mdms-login .divider::after{content:'';flex:1;height:1px;background:rgba(148,163,184,.25)}
 #mdms-login .err{color:#fda4af;font-size:.8rem;margin-top:.5rem;min-height:1.2em}
 .nav-hidden{display:none!important}
 .user-chip{display:flex;align-items:center;gap:.65rem;padding:.35rem .75rem;border:1px solid #e2e8f0;border-radius:999px;background:linear-gradient(135deg,#fff,#f8fafc);box-shadow:0 1px 2px rgba(15,23,42,.04)}
@@ -3734,7 +3738,23 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
   function loadSession(){try{return JSON.parse(localStorage.getItem(LS_SESSION)||'null')}catch{return null}}
   function saveSession(s){s?localStorage.setItem(LS_SESSION,JSON.stringify(s)):localStorage.removeItem(LS_SESSION)}
   function audit(action,detail){const l=(()=>{try{return JSON.parse(localStorage.getItem(LS_AUDIT)||'[]')}catch{return[]}})();l.unshift({ts:new Date().toISOString(),user:(loadSession()||{}).username||'-',action,detail:detail||''});localStorage.setItem(LS_AUDIT,JSON.stringify(l.slice(0,500)))}
-  async function seed(){let u=loadUsers();if(u.length===0){const pw=await sha('admin123');u=[{id:'u_'+Date.now(),fullName:'System Administrator',username:'admin',email:'admin@localhost',phone:'',role:'Super Administrator',status:'Active',pwHash:pw,avatar:'',lastLogin:null,created:new Date().toISOString()}];saveUsers(u);audit('SEED_DEFAULT','default admin created')}}
+  async function seed(){let u=loadUsers();if(u.length===0){const pw=await sha('admin123');u=[{id:'u_'+Date.now(),fullName:'System Administrator',username:'admin',email:'admin@localhost',phone:'',role:'Super Administrator',status:'Active',pwHash:pw,avatar:'',lastLogin:null,created:new Date().toISOString()}];saveUsers(u);audit('SEED_DEFAULT','default admin created')}ensureGuestAccount();}
+
+  // GUEST PORTAL — the default Guest account is seeded automatically so no
+  // manual database editing is ever required. Role/permissions come from the
+  // existing Guest role definition; the server holds the authoritative copy.
+  function ensureGuestAccount(){
+    const users=loadUsers();
+    let g=users.find(x=>String(x.username||'').toLowerCase()==='guest');
+    if(!g){
+      g={id:'u_guest',fullName:'Guest User',username:'guest',email:'',phone:'',role:'Guest',status:'Active',pwHash:'',avatar:'',lastLogin:null,created:new Date().toISOString(),system:true};
+      users.push(g);saveUsers(users);audit('SEED_GUEST','default guest account created');
+    } else if(g.role!=='Guest'||g.status!=='Active'){
+      g.role='Guest';g.status='Active';saveUsers(users);
+    }
+    return g;
+  }
+  window.mdmsEnsureGuestAccount=ensureGuestAccount;
   window.mdmsSeed=seed;
   // ===== RBAC Permission Matrix =====
   // Permission codes: FULL | RW | RO | HIDDEN  (Hidden Access = module never rendered; direct access returns 403)
@@ -3794,7 +3814,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
     if(document.getElementById('mdms-login'))return;
     const el=document.createElement('div');el.id='mdms-login';
     el.innerHTML=`<div class="glass"><div style="text-align:center;margin-bottom:1.25rem"><div style="width:64px;height:64px;margin:0 auto .75rem;border-radius:18px;background:linear-gradient(135deg,#3b82f6,#1d4ed8);display:grid;place-items:center;box-shadow:0 20px 40px -10px rgba(59,130,246,.5)"><i class="fa-solid fa-building-user" style="color:#fff;font-size:1.6rem"></i></div><h2 style="font-size:1.4rem" id="wl-login-title">${(function(){try{return JSON.parse(localStorage.getItem('wl_v3')||'{}').systemShortName||'System';}catch(_){return 'System';}})()}</h2><p style="color:#94a3b8;font-size:.78rem;letter-spacing:.12em;text-transform:uppercase;margin-top:.25rem">Secure Sign In</p></div>
-    <form id="mdms-login-form"><label>Username</label><input name="u" autocomplete="username" required><div style="margin-top:.85rem"></div><label>Password</label><input name="p" type="password" autocomplete="current-password" required><label style="display:flex;align-items:center;gap:.5rem;text-transform:none;letter-spacing:0;font-weight:500;color:#cbd5e1;margin-top:.85rem;font-size:.8rem"><input type="checkbox" name="r" style="width:auto;margin:0"> Remember me</label><div class="err" id="mdms-login-err"></div><button class="btn-primary" style="margin-top:1rem" type="submit">Sign In</button></form>
+    <form id="mdms-login-form"><label>Username</label><input name="u" autocomplete="username" required><div style="margin-top:.85rem"></div><label>Password</label><input name="p" type="password" autocomplete="current-password" required><label style="display:flex;align-items:center;gap:.5rem;text-transform:none;letter-spacing:0;font-weight:500;color:#cbd5e1;margin-top:.85rem;font-size:.8rem"><input type="checkbox" name="r" style="width:auto;margin:0"> Remember me</label><div class="err" id="mdms-login-err"></div><button class="btn-primary" style="margin-top:1rem" type="submit">Sign In</button></form><div class="divider">or</div><button type="button" id="mdms-guest-btn" class="btn-guest"><i class="fa-solid fa-user-group" style="margin-right:.5rem"></i>Continue as Guest</button><p style="color:#64748b;font-size:.68rem;text-align:center;margin-top:.45rem">Browse the dormitory map and reserve a room — no account needed.</p>
     <p style="color:#64748b;font-size:.7rem;text-align:center;margin-top:1rem">Default: <b style="color:#94a3b8">admin</b> / <b style="color:#94a3b8">admin123</b></p></div>`;
     document.body.appendChild(el);
     document.getElementById('mdms-login-form').addEventListener('submit',async(e)=>{
@@ -3802,10 +3822,43 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
       const users=loadUsers();const found=users.find(x=>x.username.toLowerCase()===u);const hash=await sha(p);
       if(!found||found.pwHash!==hash){document.getElementById('mdms-login-err').textContent='Invalid credentials';audit('LOGIN_FAIL',u);return;}
       if(found.status!=='Active'){document.getElementById('mdms-login-err').textContent='Account is inactive';return;}
+      completeLogin(found,rem,users);
+    });
+    // GUEST PORTAL — no username/password. Reuses the very same session shape,
+    // the same permission layer and the same backend Guest role.
+    const gbtn=document.getElementById('mdms-guest-btn');
+    if(gbtn) gbtn.addEventListener('click',()=>{
+      try{
+        const guest=ensureGuestAccount();
+        completeLogin(guest,false,loadUsers());
+      }catch(err){
+        console.error('[Guest] login failed',err);
+        const e2=document.getElementById('mdms-login-err');if(e2)e2.textContent='Guest access is unavailable right now.';
+      }
+    });
+
+    // Shared post-authentication routine (one implementation for every role).
+    function completeLogin(found,rem,users){
       const sess={id:found.id,username:found.username,fullName:found.fullName,role:found.role,avatar:found.avatar,lastLogin:found.lastLogin,remember:rem,loginAt:Date.now()};
       found.lastLogin=new Date().toISOString();saveUsers(users);saveSession(sess);audit('LOGIN_OK',found.username);
-      el.remove();revealApp();applyPerms();refreshAllViews&&refreshAllViews();try{if(window.switchView){window.switchView('dashboard');}document.querySelectorAll('.nav-link').forEach(l=>l.classList.remove('bg-slate-800','text-blue-400'));document.querySelector('[data-target="dashboard"]')?.classList.add('bg-slate-800','text-blue-400');}catch(e){}try{document.querySelectorAll('[data-sa-only]').forEach(b=>{b.style.display=isSuperAdmin()?'':'none';});}catch(e){}showToast&&showToast('Welcome, '+found.fullName,'success');resetIdle();
-    });
+      const guest=found.role==='Guest';
+      const landing=guest?'map':'dashboard';
+      el.remove();revealApp();applyPerms();
+      try{window.applyGuestUI&&window.applyGuestUI();}catch(e){}
+      refreshAllViews&&refreshAllViews();
+      try{if(window.switchView){window.switchView(landing);}document.querySelectorAll('.nav-link').forEach(l=>l.classList.remove('bg-slate-800','text-blue-400'));document.querySelector('[data-target="'+landing+'"]')?.classList.add('bg-slate-800','text-blue-400');}catch(e){}
+      try{document.querySelectorAll('[data-sa-only]').forEach(b=>{b.style.display=isSuperAdmin()?'':'none';});}catch(e){}
+      // Guests hold a filtered server snapshot — reload it under the Guest identity.
+      if(guest){
+        // Re-pull /api/data now that the Guest identity headers are attached:
+        // the server returns the SAME payload, filtered by the Guest role.
+        fetch('/api/data',{cache:'no-store'}).then(r=>r.ok?r.json():null).then(d=>{
+          if(d&&Array.isArray(d.rooms)){window.bhmsData=d;try{refreshAllViews&&refreshAllViews();}catch(e){}try{window.applyGuestUI&&window.applyGuestUI();}catch(e){}try{window.switchView&&window.switchView('map');}catch(e){}}
+        }).catch(()=>{});
+      }
+      showToast&&showToast(guest?'Browsing as Guest':('Welcome, '+found.fullName),'success');
+      resetIdle();
+    }
   }
   window.mdmsShowLogin=showLogin;
   window.mdmsLogout=function(){
@@ -9166,10 +9219,18 @@ body.role-guest #adm-chat-foot::after{content:"Upload your payment receipt image
 
   window.isGuestUser = function(){ const s = sess(); return !!(s && s.role === 'Guest'); };
 
+  /* The shared SSOT is declared in an earlier <script> (script-scope, not on
+   * window), so resolve it lexically with a window fallback. */
+  const DATA = () => {
+    try { if (typeof bhmsData !== 'undefined' && bhmsData) return bhmsData; } catch(_){}
+    return window.bhmsData || {};
+  };
+  window.mdmsData = DATA;
+
   /* ---- Reservations owned by this guest (the server already filters them) ---- */
   window.guestReservations = function(){
     if (!window.isGuestUser()) return [];
-    return ((window.bhmsData && window.bhmsData.reservations) || []).slice();
+    return (DATA().reservations || []).slice();
   };
   window.isAwaitingPayment = function(r){
     if (!r) return false;
@@ -9207,7 +9268,7 @@ body.role-guest #adm-chat-foot::after{content:"Upload your payment receipt image
 
   /* ---- Room modal: same modal, sensitive rows replaced by status only ---- */
   function guestRoomModal(roomId){
-    const room = ((window.bhmsData && window.bhmsData.rooms) || []).find(r => String(r.id) === String(roomId));
+    const room = (DATA().rooms || []).find(r => String(r.id) === String(roomId));
     if (!room) return;
     // Occupancy comes straight from the shared SSOT — never recalculated.
     const o = window.getRoomOccupancy(room);
@@ -9306,7 +9367,7 @@ body.role-guest #adm-chat-foot::after{content:"Upload your payment receipt image
     const r = _openRes.apply(this, arguments);
     if (window.isGuestUser()){
       const s = sess() || {};
-      const ident = (window.bhmsData && window.bhmsData.guestIdentity) || {};
+      const ident = DATA().guestIdentity || {};
       const nm = document.getElementById('res-name');
       const em = document.getElementById('res-email');
       if (nm && !nm.value) nm.value = ident.fullName || s.fullName || '';
