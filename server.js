@@ -525,12 +525,42 @@ function findEntireRoomOwner(db, room) {
     return inRoom.find(b => b.occupancyType === 'entire_room') || null;
 }
 
+const ENTIRE_ROOM_DEAD_STATUSES = ['Cancelled', 'Canceled', 'Expired', 'Rejected', 'Completed', 'Checked-out', 'Void'];
+
+function isEntireRoomReservationRecord(r, room) {
+    return !!r && String(r.roomId) === String(room.id) &&
+        (r.type === 'room' || r.occupancyType === 'entire_room' ||
+         r.reservationType === 'Entire Room' || r.scope === 'room');
+}
+
 function findEntireRoomReservation(db, room) {
     const reservations = Array.isArray(db.reservations) ? db.reservations : [];
-    return reservations.find(r => r && String(r.roomId) === String(room.id) &&
-        (r.type === 'room' || r.occupancyType === 'entire_room' || r.reservationType === 'Entire Room') &&
-        (r.status === 'Checked-in' || ENTIRE_ROOM_ACTIVE_STATUSES.includes(r.status))) || null;
+    const candidates = reservations.filter(r => isEntireRoomReservationRecord(r, room) &&
+        !ENTIRE_ROOM_DEAD_STATUSES.includes(String(r.status)));
+    // Priority: a checked-in whole-room reservation always wins over a pending one.
+    return candidates.find(r => r.status === 'Checked-in') ||
+           candidates.find(r => ENTIRE_ROOM_ACTIVE_STATUSES.includes(String(r.status))) ||
+           candidates[0] || null;
 }
+
+/** Public summary of a reservation — the ONLY shape the portals may render. */
+function reservationSummary(r) {
+    if (!r) return null;
+    return {
+        id: r.id, name: r.name || r.tenantName || 'Reservation holder',
+        email: r.email || '', contact: r.contact || r.phone || '',
+        status: r.status || 'Active',
+        type: 'Entire Room',
+        expDate: r.expDate || r.expiryDate || '',
+        expTime: r.expTime || '',
+        checkInDate: r.checkInDate || r.startDate || '',
+        reservationCredit: Number(r.reservationCredit || 0),
+        creditApplied: !!r.creditApplied,
+        paymentReference: r.paymentReference || r.reference || '',
+        boarderId: r.boarderId || null
+    };
+}
+
 
 /**
  * Authoritative occupancy for one room.
@@ -545,7 +575,14 @@ function computeRoomOccupancy(db, room) {
             occupied: 0, reserved: 0, available: 0, percent: 0,
             status: 'Admin', occupancyLabel: 'Admin', bedLabel: '—',
             chips: [], showResChip: false, showFreeChip: false, locked: true,
-            footer: { occ: '0 OCC', res: '', line2: 'ADMIN' }
+            footer: { occ: '0 OCC', res: '', line2: 'ADMIN' },
+            /* room-details SSOT */
+            entireCheckedIn: false, entireReserved: false,
+            bedOccupied: false, bedReserved: false,
+            entireReservation: null, subtitle: 'Admin Office',
+            showBedCards: false,
+            blockEntireReason: 'Invalid room.',
+            blockBedReason: 'Invalid room.'
         };
     }
 
@@ -567,7 +604,14 @@ function computeRoomOccupancy(db, room) {
             reservationId: entireRes ? entireRes.id : null,
             chips: [{ kind: 'occ', title: 'Entire room occupant' }],
             showResChip: false, showFreeChip: false, locked: true,
-            footer: { occ: '1 OCC', res: '', line2: 'ENTIRE ROOM' }
+            footer: { occ: '1 OCC', res: '', line2: 'ENTIRE ROOM' },
+            entireCheckedIn: true, entireReserved: false,
+            bedOccupied: false, bedReserved: false,
+            entireReservation: reservationSummary(entireRes),
+            subtitle: '1 OCC · ENTIRE ROOM',
+            showBedCards: false,
+            blockEntireReason: 'Room is already occupied as an Entire Room.',
+            blockBedReason: 'Room is occupied as an Entire Room \u2014 Bed Space transactions are blocked.'
         };
     }
 
@@ -583,7 +627,14 @@ function computeRoomOccupancy(db, room) {
             reservationId: entireRes.id,
             chips: [{ kind: 'res', title: 'Entire room reservation' }],
             showResChip: true, showFreeChip: false, locked: true,
-            footer: { occ: '0 OCC', res: '1 RES', line2: 'ENTIRE ROOM' }
+            footer: { occ: '0 OCC', res: '1 RES', line2: 'ENTIRE ROOM' },
+            entireCheckedIn: false, entireReserved: true,
+            bedOccupied: false, bedReserved: false,
+            entireReservation: reservationSummary(entireRes),
+            subtitle: 'Entire Room Reserved',
+            showBedCards: false,
+            blockEntireReason: 'Room already has an active Entire Room reservation.',
+            blockBedReason: 'Room is reserved as an Entire Room \u2014 Bed Space transactions are blocked.'
         };
     }
 
@@ -609,9 +660,20 @@ function computeRoomOccupancy(db, room) {
         showResChip: reserved > 0,
         showFreeChip: available > 0,
         locked: false,
-        footer: { occ: occupied + ' OCC', res: reserved ? reserved + ' RES' : '', line2: available + ' FREE' }
+        footer: { occ: occupied + ' OCC', res: reserved ? reserved + ' RES' : '', line2: available + ' FREE' },
+        entireCheckedIn: false, entireReserved: false,
+        bedOccupied: occupied > 0, bedReserved: reserved > 0,
+        entireReservation: null,
+        subtitle: 'Occupancy Status',
+        showBedCards: beds.length > 0,
+        blockEntireReason: !beds.length ? 'Invalid room.'
+            : occupied > 0 ? 'Blocked \u2014 this room already has active Bed Space occupants.'
+            : reserved > 0 ? 'Blocked \u2014 this room already has Bed Space reservations.'
+            : null,
+        blockBedReason: null
     };
 }
+
 
 /** Occupancy for every room — one payload, both portals. */
 function computeOccupancyMap(db) {
@@ -626,6 +688,9 @@ function computeOccupancyMap(db) {
 /** Attach the authoritative occupancy onto each room of an outgoing payload. */
 function withOccupancy(db) {
     try {
+        // Reservation credits are derived from the Official Receipt Archive and
+        // must be refreshed before the portals read them.
+        try { syncAllReservationCredits(db); } catch (_) {}
         const map = computeOccupancyMap(db);
         (Array.isArray(db.rooms) ? db.rooms : []).forEach(room => {
             if (room) room.occupancy = map[String(room.id)] || null;
@@ -634,6 +699,7 @@ function withOccupancy(db) {
     } catch (e) { console.error('[OCCUPANCY]', e.message); }
     return db;
 }
+
 
 
 
@@ -2606,16 +2672,18 @@ app.post('/api/data', (req, res) => {
         // === NEW: Server-side validation for check-in scope & payment integrity ===
         try {
             const _priorIds = new Set((existing.boarders || []).map(b => b.id));
-            // AUTOMATIC RESERVATION CREDIT: newly checked-in boarders inherit
-            // any credit verified from their GCash receipt.
+            // AUTOMATIC RESERVATION CREDIT AT CHECK-IN.
+            // The Official Receipt Archive is the ONLY source of the credit:
             // Rental Fee + Security Deposit - Reservation Credit = Balance.
+            // A client-supplied reservationCredit is ignored on purpose.
             try {
+                syncAllReservationCredits(merged);
                 (merged.boarders || []).forEach(b => {
                     if (_priorIds.has(b.id)) return;
-                    if (b.reservationCredit != null) return;
                     applyReservationCreditToBoarder(merged, b);
                 });
             } catch (_e) { console.warn('[RES-CREDIT] sweep warn:', _e.message); }
+
             const _reservations = Array.isArray(merged.reservations) ? merged.reservations : [];
             const _resById = new Map(_reservations.map(r => [r.id, r]));
             const _incomingBoarders = Array.isArray(merged.boarders) ? merged.boarders : [];
@@ -3565,6 +3633,45 @@ function creditReservation(db, receipt) {
     return res;
 }
 
+/* ====================================================================
+ * RESERVATION CREDIT — THE OFFICIAL RECEIPT IS THE ONLY SOURCE
+ * --------------------------------------------------------------------
+ * Every approved Reservation Fee payment produces exactly one Official
+ * Receipt (official-receipts.js). The reservation credit is therefore the
+ * sum of the LIVE (non-void) Reservation-Fee ORs attached to it — never a
+ * number typed by a user and never a client-side computation.
+ * ==================================================================== */
+const RESERVATION_FEE_CATEGORIES = ['Reservation Fee', 'Reservation Payment', 'Reservation'];
+
+function officialReceiptsForReservation(db, reservationId) {
+    if (!reservationId) return [];
+    return (Array.isArray(db.officialReceipts) ? db.officialReceipts : []).filter(o =>
+        o && o.status !== 'Void' &&
+        String(o.reservationId || '') === String(reservationId) &&
+        RESERVATION_FEE_CATEGORIES.includes(String(o.category)));
+}
+
+/** Recompute reservation.reservationCredit from the Official Receipt Archive. */
+function syncReservationCreditFromOfficialReceipts(db, reservation) {
+    if (!reservation) return 0;
+    const ors = officialReceiptsForReservation(db, reservation.id);
+    if (!ors.length) return Number(reservation.reservationCredit || 0);
+    const total = ors.reduce((s, o) => s + (Number(o.amount) || 0), 0);
+    reservation.reservationCredit = total;
+    reservation.reservationCreditSource = 'Official Receipt';
+    reservation.reservationCreditOrNumbers = ors.map(o => o.orNumber);
+    reservation.paymentReference = reservation.paymentReference ||
+        (ors[ors.length - 1].paymentReference || '');
+    return total;
+}
+
+/** Recompute every reservation credit — cheap, idempotent, always safe. */
+function syncAllReservationCredits(db) {
+    (Array.isArray(db.reservations) ? db.reservations : [])
+        .forEach(r => { try { syncReservationCreditFromOfficialReceipts(db, r); } catch (_) {} });
+    return db;
+}
+
 /**
  * Deduct any stored Reservation Credit when a reservation becomes an
  * Active Boarder. Rental Fee + Security Deposit − Reservation Credit.
@@ -3577,8 +3684,10 @@ function applyReservationCreditToBoarder(db, boarder) {
         (r.email && boarder.email && String(r.email).toLowerCase() === String(boarder.email).toLowerCase() &&
          String(r.roomId) === String(boarder.roomId) && !r.creditApplied));
     if (!res) return null;
-    const credit = Number(res.reservationCredit || 0);
+    // Official Receipts are authoritative: refresh the credit before applying it.
+    const credit = Number(syncReservationCreditFromOfficialReceipts(db, res) || res.reservationCredit || 0);
     if (!credit || res.creditApplied) return null;
+
 
     const rent = Number(boarder.rentalFee != null ? boarder.rentalFee : (boarder.monthlyRate || boarder.rate || 0)) || 0;
     const deposit = Number(boarder.securityDeposit != null ? boarder.securityDeposit : (boarder.deposit || 0)) || 0;
@@ -3616,9 +3725,18 @@ app.post('/api/reservation-credit/preview', (req, res) => {
         const db = chatEnsure(readStorage());
         const { reservationId, rentalFee, securityDeposit } = req.body || {};
         const r = (db.reservations || []).find(x => String(x.id) === String(reservationId));
+        // The Official Receipt Archive is the source of the credit.
+        if (r) syncReservationCreditFromOfficialReceipts(db, r);
         const credit = r && !r.creditApplied ? Number(r.reservationCredit || 0) : 0;
         const gross = (Number(rentalFee) || 0) + (Number(securityDeposit) || 0);
-        res.json({ credit, gross, balance: Math.max(0, gross - Math.min(credit, gross)), creditApplied: !!(r && r.creditApplied) });
+        res.json({
+            credit, gross,
+            balance: Math.max(0, gross - Math.min(credit, gross)),
+            creditApplied: !!(r && r.creditApplied),
+            orNumbers: (r && r.reservationCreditOrNumbers) || [],
+            source: 'Official Receipt'
+        });
+
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
