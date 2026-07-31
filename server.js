@@ -61,6 +61,12 @@ const ROLE_MATRIX = {
     'Super Administrator': { userManagement:'FULL',  systemSettings:'FULL',  resetDatabase:'FULL',  whiteLabel:'FULL',  emailConfig:'FULL',  receiptArchive:'FULL',  roomInventory:'FULL',  roomSettings:'FULL',  billing:'FULL', reservations:'FULL', maintenance:'FULL', reports:'FULL' },
     'Administrator':       { userManagement:'FULL',  systemSettings:'FULL',  resetDatabase:'HIDDEN',whiteLabel:'HIDDEN',emailConfig:'HIDDEN',receiptArchive:'FULL',  roomInventory:'FULL',  roomSettings:'FULL',  billing:'FULL', reservations:'FULL', maintenance:'FULL', reports:'FULL' },
     'Staff':               { userManagement:'HIDDEN',systemSettings:'HIDDEN',resetDatabase:'HIDDEN',whiteLabel:'HIDDEN',emailConfig:'HIDDEN',receiptArchive:'HIDDEN',roomInventory:'HIDDEN',roomSettings:'HIDDEN',billing:'RW',   reservations:'FULL', maintenance:'FULL', reports:'RO' }
+,
+    // GUEST PORTAL — a Guest is a public visitor account. It consumes the SAME
+    // Dormitory Map endpoints as the Admin Portal; the payload is only stripped
+    // of sensitive fields (see sanitizeDbForGuest). Reservations are RW so the
+    // EXISTING reservation workflow/approval system can be reused as-is.
+    'Guest':               { userManagement:'HIDDEN',systemSettings:'HIDDEN',resetDatabase:'HIDDEN',whiteLabel:'HIDDEN',emailConfig:'HIDDEN',receiptArchive:'HIDDEN',roomInventory:'HIDDEN',roomSettings:'HIDDEN',billing:'HIDDEN',reservations:'RW',   maintenance:'HIDDEN', reports:'HIDDEN' }
 };
 const VALID_ROLES = Object.keys(ROLE_MATRIX);
 
@@ -74,7 +80,14 @@ function identify(req) {
     } catch (_) {}
     // The persisted record always wins over whatever the client claims.
     const role = stored ? stored.role : claimed;
-    return { username, role: VALID_ROLES.includes(role) ? role : (role || ''), verified: !!stored };
+    return {
+        username,
+        role: VALID_ROLES.includes(role) ? role : (role || ''),
+        verified: !!stored,
+        id: stored ? stored.id : null,
+        email: stored ? String(stored.email || '') : '',
+        fullName: stored ? String(stored.fullName || '') : ''
+    };
 }
 
 function levelFor(role, mod) {
@@ -93,6 +106,182 @@ function deny(res, mod) {
     return res.status(403).json({ error: '403 Forbidden — Access Denied', module: mod });
 }
 
+/* ====================================================================
+ * GUEST PORTAL — ROLE-BASED RESPONSE FILTERING (no duplicated endpoints)
+ * --------------------------------------------------------------------
+ * A Guest consumes exactly the SAME endpoints as the Dormitory Map
+ * (/api/data, /api/occupancy, /api/chat/*). Nothing here recomputes
+ * occupancy: computeRoomOccupancy() stays the single source of truth and
+ * its object is forwarded verbatim, minus the occupant identity fields.
+ *
+ *   Admin room  -> { roomNo, occupants, paymentInfo, boarders, ... }
+ *   Guest room  -> { roomNo, capacity, availableBeds, monthlyRate, status }
+ * ==================================================================== */
+const GUEST_ROLE = 'Guest';
+function isGuestReq(req) { return !!(req && req.mdmsUser && req.mdmsUser.role === GUEST_ROLE); }
+
+/** A reservation is "Awaiting Payment" while it exists and is unpaid. */
+function isAwaitingPayment(r) {
+    if (!r) return false;
+    const st = String(r.status || '');
+    if (st === 'Awaiting Payment') return true;
+    if (String(r.paymentStatus || '') === 'Awaiting Payment') return true;
+    return !r.paymentVerified && (st === 'Active' || st === 'Pending');
+}
+
+/** Does this reservation belong to the calling Guest account? */
+function guestOwnsReservation(r, who) {
+    if (!r || !who) return false;
+    const u = String(who.username || '').toLowerCase();
+    const e = String(who.email || '').toLowerCase();
+    return (u && String(r.guestUser || '').toLowerCase() === u) ||
+           (e && String(r.email || '').toLowerCase() === e);
+}
+
+/** Occupancy passthrough: identical counters, identity fields removed. */
+function guestOccupancy(o) {
+    if (!o || typeof o !== 'object') return o || null;
+    const copy = { ...o };
+    delete copy.occupantName;
+    delete copy.occupantId;
+    delete copy.reservationId;
+    return copy;
+}
+
+/** Room projection for Guests — public facts only. */
+function guestRoom(room) {
+    if (!room) return room;
+    const occ = guestOccupancy(room.occupancy);
+    const beds = (Array.isArray(room.beds) ? room.beds : []).map(b => ({
+        bedNo: b && (b.bedNo || b.number),
+        // Status only. No boarderId, no reservationId, no names.
+        isOccupied: !!(b && (b.isOccupied || b.boarderId)),
+        isReserved: !!(b && b.isReserved && !b.isOccupied)
+    }));
+    return {
+        id: room.id,
+        roomName: room.roomName,
+        roomNo: room.roomName,
+        type: room.type,
+        floor: room.floor,
+        floorId: room.floorId,
+        floorName: room.floorName,
+        capacity: Number(room.capacity || beds.length || 0),
+        monthlyRate: Number(room.rate || room.monthlyRate || room.price || 0),
+        rate: Number(room.rate || room.monthlyRate || room.price || 0),
+        amenities: room.amenities || room.inventory || [],
+        description: room.description || '',
+        status: (occ && occ.status) || room.status,
+        availableBeds: occ ? occ.available : undefined,
+        occupiedBeds: occ ? occ.occupied : undefined,
+        reservedBeds: occ ? occ.reserved : undefined,
+        occupancy: occ,
+        beds
+    };
+}
+
+/** The Guest's own reservation, without internal/financial internals. */
+function guestReservation(r) {
+    return {
+        id: r.id, type: r.type, occupancyType: r.occupancyType,
+        roomId: r.roomId, bedNo: r.bedNo,
+        name: r.name, contact: r.contact, email: r.email,
+        date: r.date, time: r.time, expDate: r.expDate, expTime: r.expTime,
+        deposit: r.deposit, status: r.status,
+        paymentStatus: r.paymentStatus || (r.paymentVerified ? 'Paid' : 'Awaiting Payment'),
+        paymentVerified: !!r.paymentVerified,
+        awaitingPayment: isAwaitingPayment(r),
+        createdAt: r.createdAt
+    };
+}
+
+/** Strip a full database snapshot down to what a Guest may ever see. */
+function sanitizeDbForGuest(db, who) {
+    const rooms = (Array.isArray(db.rooms) ? db.rooms : []).map(guestRoom);
+    const occupancyMap = {};
+    Object.keys(db.occupancyMap || {}).forEach(k => { occupancyMap[k] = guestOccupancy(db.occupancyMap[k]); });
+    const mine = (Array.isArray(db.reservations) ? db.reservations : []).filter(r => guestOwnsReservation(r, who));
+    return {
+        rooms,
+        occupancyMap,
+        reservations: mine.map(guestReservation),
+        floors: db.floors || [],
+        // Everything else is intentionally empty for a Guest: no boarders, no
+        // transactions, no billing, no users, no receipts, no email logs.
+        boarders: [], formerBoarders: [], transactions: [], waitingList: [], waitlist: [],
+        maintenance: [], emailLogs: [], receiptArchive: [], officialReceipts: [],
+        chatThreads: [], chatMessages: [], users: [],
+        settings: { whiteLabel: ((db.settings || {}).whiteLabel) || DEFAULT_WHITE_LABEL },
+        guestPortal: true,
+        guestIdentity: { username: who.username, fullName: who.fullName, email: who.email }
+    };
+}
+
+/**
+ * Guest data sync. A Guest never owns the database, so a Guest POST /api/data
+ * can only APPEND new reservations (plus the bed flags those reservations
+ * imply) onto the authoritative server snapshot. Everything else is ignored.
+ * The records created here are ordinary reservations — the same collection,
+ * the same approval system, the same validators.
+ */
+function guestMergeData(existing, incoming, who) {
+    const db = existing;
+    db.reservations = Array.isArray(db.reservations) ? db.reservations : [];
+    const known = new Set(db.reservations.map(r => String(r.id)));
+    const inRes = Array.isArray(incoming.reservations) ? incoming.reservations : [];
+    const added = [];
+    inRes.forEach(r => {
+        if (!r || !r.id || known.has(String(r.id))) return;
+        const room = (db.rooms || []).find(x => String(x.id) === String(r.roomId));
+        if (!room) return;
+        const rec = {
+            ...r,
+            // Reuse the existing workflow status; payment is what is pending.
+            status: r.status || 'Active',
+            paymentStatus: 'Awaiting Payment',
+            paymentVerified: false,
+            source: 'Guest Portal',
+            createdBy: GUEST_ROLE,
+            guestUser: who.username || '',
+            guestEmail: String(r.email || who.email || '')
+        };
+        db.reservations.push(rec);
+        added.push(rec);
+    });
+    // Mirror the bed-flag side effects of the existing reservation workflow.
+    added.forEach(r => {
+        const room = (db.rooms || []).find(x => String(x.id) === String(r.roomId));
+        if (!room || !Array.isArray(room.beds)) return;
+        if (r.type === 'room' || r.occupancyType === 'entire_room') {
+            room.beds.forEach(b => { b.isReserved = true; b.reservationId = r.id; });
+        } else {
+            const bed = room.beds.find(b => String(b.bedNo) === String(r.bedNo));
+            if (bed && !bed.isOccupied && !bed.isReserved) { bed.isReserved = true; bed.reservationId = r.id; }
+        }
+    });
+    return { db, added };
+}
+
+/**
+ * Guest API allow-list. Deny-by-default: a Guest may only reach the endpoints
+ * the Dormitory Map + reservation + receipt-chat flows actually need.
+ */
+const GUEST_ALLOW = [
+    { m: 'GET',  re: /^\/data$/ },
+    { m: 'POST', re: /^\/data$/ },
+    { m: 'GET',  re: /^\/occupancy$/ },
+    { m: 'GET',  re: /^\/floors$/ },
+    { m: 'GET',  re: /^\/whitelabel$/ },
+    { m: 'GET',  re: /^\/payment-providers$/ },
+    { m: 'POST', re: /^\/send-reservation-email$/ },
+    { m: 'POST', re: /^\/send-notification$/ },
+    { m: 'POST', re: /^\/chat\/thread$/ },
+    { m: 'GET',  re: /^\/chat\/messages$/ },
+    { m: 'POST', re: /^\/chat\/read$/ },
+    { m: 'POST', re: /^\/chat\/typing$/ },
+    { m: 'POST', re: /^\/chat\/message$/ }
+];
+
 // Route-level guards
 const GUARDS = [
     { method: 'POST', path: '/api/reset-system', mod: 'resetDatabase', action: 'write' },
@@ -108,6 +297,41 @@ app.use('/api', (req, res, next) => {
     const who = identify(req);
     req.mdmsUser = who;
     const isSA = who.role === 'Super Administrator';
+
+    /* ---------------- GUEST PORTAL ENFORCEMENT ----------------
+     * UI filtering hides the controls; these rules are what actually
+     * protect the data. Guests share the endpoints, never the payload. */
+    if (who.role === GUEST_ROLE) {
+        const ok = GUEST_ALLOW.some(g => g.m === req.method && g.re.test(req.path));
+        if (!ok) return deny(res, 'guestPortal');
+
+        // Chat: image/receipt only, own thread only, only while Awaiting Payment.
+        if (req.path.indexOf('/chat/') === 0) {
+            try {
+                const db = readStorage();
+                const body = req.body || {};
+                const threadId = body.threadId || req.query.threadId;
+                if (req.path === '/chat/thread') {
+                    const r = (db.reservations || []).find(x => String(x.id) === String(body.reservationId));
+                    if (!r || !guestOwnsReservation(r, who)) return deny(res, 'chat');
+                    if (!isAwaitingPayment(r)) return res.status(409).json({ error: 'Messaging opens only while the reservation is Awaiting Payment.' });
+                } else if (threadId) {
+                    const t = (db.chatThreads || []).find(x => String(x.id) === String(threadId));
+                    const r = t ? (db.reservations || []).find(x => String(x.id) === String(t.reservationId)) : null;
+                    if (!t || !r || !guestOwnsReservation(r, who)) return deny(res, 'chat');
+                    if (!isAwaitingPayment(r)) return res.status(409).json({ error: 'Messaging is closed for this reservation.' });
+                }
+                if (req.path === '/chat/message') {
+                    // No general messaging / text chat for Guests: attachments only.
+                    if (!body.attachment || !body.attachment.dataUrl) {
+                        return res.status(403).json({ error: 'Guests may only upload a payment receipt image.' });
+                    }
+                    req.body.text = '';
+                }
+                if (req.body && req.body.role) req.body.role = 'tenant';
+            } catch (_) { return deny(res, 'chat'); }
+        }
+    }
 
     // Only a real, known role may act. Unknown/blank identity keeps the legacy
     // permissive behaviour needed for first boot + login, but never for the
@@ -2514,9 +2738,13 @@ function autoReceiptPendingTransactions(db, previous, req) {
  * API ROUTES — all existing routes preserved, plus new ones
  * ==================================================================== */
 app.get('/api/data', (req, res) => {
-    // Every payload carries the backend-computed occupancy so the Admin and
-    // Tenant maps render identical numbers without any client-side maths.
-    try { res.status(200).json(withOccupancy(readStorage())); }
+    // Every payload carries the backend-computed occupancy so the Admin, Tenant
+    // and Guest maps render identical numbers without any client-side maths.
+    // The Guest response is the SAME payload with sensitive fields removed.
+    try {
+        const payload = withOccupancy(readStorage());
+        res.status(200).json(isGuestReq(req) ? sanitizeDbForGuest(payload, req.mdmsUser) : payload);
+    }
     catch (e) { res.status(500).json({ error: 'Data read failed.', details: e.message }); }
 });
 
@@ -2524,8 +2752,11 @@ app.get('/api/data', (req, res) => {
 app.get('/api/occupancy', (req, res) => {
     try {
         const db = readStorage();
-        const map = computeOccupancyMap(db);
-        const list = Object.values(map);
+        const raw = computeOccupancyMap(db);
+        const list = Object.values(raw);
+        // Guests receive the identical occupancy numbers, minus occupant identity.
+        const map = {};
+        Object.keys(raw).forEach(k => { map[k] = isGuestReq(req) ? guestOccupancy(raw[k]) : raw[k]; });
         res.json({
             rooms: map,
             totals: {
@@ -2544,6 +2775,24 @@ app.get('/api/occupancy', (req, res) => {
 app.post('/api/data', (req, res) => {
     try {
         if (!req.body || typeof req.body !== 'object') return res.status(400).json({ error: 'Invalid payload.' });
+
+        /* GUEST SYNC — a Guest holds a filtered snapshot, so it can never be
+         * written back wholesale. Only brand-new reservations are appended,
+         * then validated by the SAME validateNewReservations() guard used by
+         * the Admin Portal. */
+        if (isGuestReq(req)) {
+            const base = readStorage();
+            const before = JSON.parse(JSON.stringify(base));
+            const { db: gmerged, added } = guestMergeData(base, req.body, req.mdmsUser);
+            const gErr = validateNewReservations(before, gmerged);
+            if (gErr) return res.status(400).json(gErr);
+            delete gmerged.occupancyMap;
+            if (Array.isArray(gmerged.rooms)) gmerged.rooms.forEach(r => { if (r) delete r.occupancy; });
+            (gmerged.reservations || []).forEach(stripSensitivePaymentFields);
+            writeStorageAtomic(gmerged);
+            added.forEach(r => appendAuditEntry('Guest Portal', 'Reservation ' + r.id + ' submitted by guest ' + (req.mdmsUser.username || ''), req));
+            return res.status(200).json({ success: true, message: 'Reservation submitted.', reservations: added.map(guestReservation) });
+        }
         // Preserve server-owned collections that the frontend does NOT manage:
         //   - emailLogs: written by the backend email pipeline (retries, receipts,
         //     scheduler reminders, reservation emails). Frontend syncs must never
