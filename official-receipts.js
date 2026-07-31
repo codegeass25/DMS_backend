@@ -207,9 +207,6 @@ function issueOfficialReceipt(db, payload) {
         dateApproved: receipt.approvedAt,
         approvedBy: receipt.approvedBy,
         status: 'PAID',
-        // Income & Payment Report SSOT: an issued Official Receipt is always
-        // collected income until the OR itself is voided.
-        isIncome: true,
         createdAt: now.toISOString()
     });
 
@@ -239,29 +236,7 @@ function voidOfficialReceipt(db, orId, reason, who) {
     r.voidReason = reason || '';
     r.voidedBy = who || 'Administrator';
     r.voidedAt = new Date().toISOString();
-    db.financialReports.forEach(f => {
-        if (f.officialReceiptId === r.id) { f.status = 'VOID'; f.isIncome = false; }
-    });
-    /* A voided OR must disappear from every financial module at once. */
-    ['transactions', 'paymentHistory', 'ledger', 'reservationPaymentHistory', 'checkinPaymentHistory']
-        .forEach(k => {
-            if (!Array.isArray(db[k])) return;
-            db[k].forEach(row => {
-                if (row && String(row.officialReceiptId) === String(r.id)) {
-                    row.status = 'Void'; row.void = true; row.isIncome = false;
-                }
-            });
-        });
-    /* Recompute the reservation credit: the void removes the paid amount. */
-    if (r.reservationId && Array.isArray(db.reservations)) {
-        const res = db.reservations.find(x => String(x.id) === String(r.reservationId));
-        if (res) {
-            const live = db.officialReceipts.filter(o => o.status !== 'Void' &&
-                String(o.reservationId || '') === String(r.reservationId));
-            res.reservationCredit = live.reduce((sum, o) => sum + (Number(o.amount) || 0), 0);
-            res.reservationCreditOrNumbers = live.map(o => o.orNumber);
-        }
-    }
+    db.financialReports.forEach(f => { if (f.officialReceiptId === r.id) f.status = 'VOID'; });
     if (deps.appendAuditEntry) {
         deps.appendAuditEntry('Official Receipt', 'Official Receipt ' + r.orNumber + ' voided by ' + r.voidedBy);
     }
