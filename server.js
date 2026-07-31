@@ -4948,6 +4948,278 @@ app.get('/uploads/:filename', (req, res) => {
 
 
 /* ====================================================================
+ * TENANT PORTAL API  (Tenant_index.html)
+ * --------------------------------------------------------------------
+ * The Tenant Portal is a RESTRICTED MIRROR of the Admin Dormitory Map.
+ * It owns NO business logic: every value below is produced by the same
+ * helpers the Admin Portal uses (computeRoomOccupancy, the reservation
+ * lifecycle normalizer, the entire-room reconciler, BrandingService and
+ * the email pipeline). Nothing here re-implements or re-computes them.
+ *
+ * PRIVACY CONTRACT: these responses are SANITIZED at the source. No
+ * boarder, occupant or reservation-holder identity ever leaves the
+ * server on a tenant route — occupied/reserved units are labelled
+ * "TENANT" and nothing else. Hiding data in the browser is not enough,
+ * so the data is simply never transmitted.
+ * ==================================================================== */
+
+const TENANT_OCCUPANT_LABEL = 'TENANT';
+
+/** Strip every identity field from the authoritative occupancy object. */
+function tenantSanitizeOccupancy(o) {
+    if (!o) return null;
+    return {
+        roomId: o.roomId,
+        mode: o.mode,
+        entireRoom: !!o.entireRoom,
+        capacity: o.capacity,
+        occupied: o.occupied,
+        reserved: o.reserved,
+        available: o.available,
+        percent: o.percent,
+        status: o.status,
+        occupancyLabel: o.occupancyLabel,
+        bedLabel: o.bedLabel,
+        chips: Array.isArray(o.chips) ? o.chips.map(c => ({
+            kind: c.kind,
+            label: c.label || '',
+            title: c.kind === 'occ' ? TENANT_OCCUPANT_LABEL
+                 : c.kind === 'res' ? TENANT_OCCUPANT_LABEL
+                 : c.title
+        })) : [],
+        showResChip: !!o.showResChip,
+        showFreeChip: !!o.showFreeChip,
+        locked: !!o.locked,
+        footer: o.footer,
+        entireCheckedIn: !!o.entireCheckedIn,
+        entireReserved: !!o.entireReserved,
+        bedOccupied: !!o.bedOccupied,
+        bedReserved: !!o.bedReserved,
+        showBedCards: !!o.showBedCards,
+        subtitle: o.subtitle,
+        blockEntireReason: o.blockEntireReason || null,
+        blockBedReason: o.blockBedReason || null,
+        occupantLabel: (o.occupied || o.reserved) ? TENANT_OCCUPANT_LABEL : null
+        /* deliberately omitted: occupantName, occupantId, reservationId,
+           entireReservation — tenant-facing PII. */
+    };
+}
+
+/** A room as the tenant is allowed to see it. Availability only. */
+function tenantSanitizeRoom(db, room) {
+    const occ = computeRoomOccupancy(db, room);
+    const beds = Array.isArray(room.beds) ? room.beds : [];
+    return {
+        id: room.id,
+        roomName: room.roomName || ('Room ' + (room.roomNumber || room.id)),
+        roomNumber: room.roomNumber || null,
+        floorId: room.floorId != null ? room.floorId : room.floor,
+        floorName: room.floorName || null,
+        type: room.type || 'Standard',
+        capacity: occ.capacity,
+        rate: Number(room.rate || 0) || 0,
+        inventory: Array.isArray(room.inventory) ? room.inventory : [],
+        status: room.type === 'Admin' ? 'Admin' : occ.status,
+        occupancy: tenantSanitizeOccupancy(occ),
+        /* Bed units carry a state and NOTHING else. */
+        beds: (occ.showBedCards ? beds : []).map(b => ({
+            bedNo: b.bedNo || b.number || b.id,
+            state: (b.isOccupied || b.boarderId) ? 'occupied' : (b.isReserved ? 'reserved' : 'available'),
+            occupantLabel: (b.isOccupied || b.boarderId || b.isReserved) ? TENANT_OCCUPANT_LABEL : null,
+            selectable: !(b.isOccupied || b.boarderId || b.isReserved) && !occ.locked
+        }))
+    };
+}
+
+/** Branding subset that is safe to publish. */
+function tenantSanitizeBranding(db) {
+    const wl = BrandingService.get(db) || {};
+    const keep = ['dormName', 'companyName', 'businessName', 'systemName', 'systemShortName',
+        'browserTitle', 'address', 'contactNumber', 'email', 'website', 'logoUrl', 'faviconUrl',
+        'loadingLogoUrl', 'qrCode', 'primaryColor', 'secondaryColor', 'currencySymbol',
+        'receiptHeader', 'receiptFooter', 'emailFooter', 'emailSignature'];
+    const out = {};
+    keep.forEach(k => { if (wl[k] != null) out[k] = wl[k]; });
+    return out;
+}
+
+/** The tenant's OWN reservation — their own details only, no other party. */
+function tenantSanitizeReservation(db, r) {
+    if (!r) return null;
+    const room = (db.rooms || []).find(x => String(x.id) === String(r.roomId));
+    return {
+        id: r.id,
+        status: canonicalReservationStatus(r),
+        isActive: isReservationActive(r),
+        checkedIn: isReservationCheckedIn(r),
+        approvalStatus: r.approvalStatus || 'Pending',
+        paymentStatus: r.paymentStatus || 'Pending Verification',
+        paymentVerified: !!r.paymentVerified,
+        reservationCredit: Number(r.reservationCredit || 0) || 0,
+        type: r.type,
+        reservationType: r.reservationType,
+        roomId: r.roomId,
+        roomName: room ? (room.roomName || ('Room ' + room.roomNumber)) : null,
+        bedNo: r.bedNo || null,
+        date: r.date, time: r.time,
+        expDate: r.expDate || '', expTime: r.expTime || '',
+        name: r.name, email: r.email, contact: r.contact,
+        createdAt: r.createdAt,
+        lastStatusChangeAt: r.lastStatusChangeAt || null,
+        canCancel: !RESERVATION_TERMINAL_STATUSES.includes(canonicalReservationStatus(r)) &&
+                   canonicalReservationStatus(r) !== RESERVATION_STATUS.CHECKED_IN
+    };
+}
+
+/** Everything the Tenant Dormitory Map needs, in ONE sanitized payload. */
+app.get('/api/tenant/bootstrap', (req, res) => {
+    try {
+        const db = readStorage();
+        try { normalizeReservationLifecycle(db); } catch (_) {}
+        const rooms = (Array.isArray(db.rooms) ? db.rooms : []).map(r => tenantSanitizeRoom(db, r));
+        const real = rooms.filter(r => r.type !== 'Admin');
+        res.json({
+            whiteLabel: tenantSanitizeBranding(db),
+            floors: (Array.isArray(db.floors) ? db.floors : []).map(f => ({
+                id: f.id, name: f.name, order: f.order != null ? f.order : 0
+            })),
+            rooms,
+            stats: {
+                availableRooms: real.filter(r => r.status === 'Available').length,
+                capacity: real.reduce((s, r) => s + (r.occupancy ? r.occupancy.capacity : 0), 0),
+                occupied: real.reduce((s, r) => s + (r.occupancy ? r.occupancy.occupied : 0), 0),
+                reserved: real.reduce((s, r) => s + (r.occupancy ? r.occupancy.reserved : 0), 0),
+                available: real.reduce((s, r) => s + (r.occupancy ? r.occupancy.available : 0), 0),
+                occupancyRate: (() => {
+                    const cap = real.reduce((s, r) => s + (r.occupancy ? r.occupancy.capacity : 0), 0);
+                    const occ = real.reduce((s, r) => s + (r.occupancy ? r.occupancy.occupied : 0), 0);
+                    return cap ? Math.round((occ / cap) * 100) : 0;
+                })()
+            },
+            serverTime: new Date().toISOString()
+        });
+    } catch (e) { res.status(500).json({ error: 'Tenant bootstrap failed.', details: e.message }); }
+});
+
+/**
+ * Create a reservation from the Tenant Portal.
+ * Validation, bed holding, lifecycle stamping and entire-room reconciliation
+ * all run through the SAME server helpers used by the Admin Portal, so a
+ * tenant-created reservation is byte-for-byte an admin-created reservation.
+ * The status is ALWAYS Pending — only the Admin Portal may advance it.
+ */
+app.post('/api/tenant/reservations', async (req, res) => {
+    try {
+        const b = req.body || {};
+        const type = b.type === 'room' ? 'room' : 'bed';
+        const name = String(b.name || '').trim();
+        const contact = String(b.contact || '').trim();
+        const email = String(b.email || '').trim();
+        const date = String(b.date || '').trim();
+        const time = String(b.time || '').trim();
+
+        if (!name || !contact) return res.status(400).json({ error: 'Full name and contact number are required.' });
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'A valid email address is required.' });
+        if (!date || !time) return res.status(400).json({ error: 'Reservation date and time are required.' });
+
+        const db = readStorage();
+        const room = (db.rooms || []).find(r => String(r.id) === String(b.roomId));
+        if (!room) return res.status(404).json({ error: 'That room no longer exists. Please pick another.' });
+        if (room.type === 'Admin') return res.status(400).json({ error: 'This unit is not reservable.' });
+
+        // Authoritative eligibility — the SAME occupancy SSOT the maps render.
+        const occ = computeRoomOccupancy(db, room);
+        if (type === 'room' && occ.blockEntireReason) return res.status(409).json({ error: occ.blockEntireReason });
+        if (type === 'bed' && occ.blockBedReason) return res.status(409).json({ error: occ.blockBedReason });
+
+        const beds = Array.isArray(room.beds) ? room.beds : [];
+        let bed = null;
+        if (type === 'bed') {
+            bed = beds.find(x => String(x.bedNo || x.number) === String(b.bedNo));
+            if (!bed) return res.status(404).json({ error: 'That bed no longer exists.' });
+            if (bed.isOccupied || bed.boarderId || bed.isReserved) {
+                return res.status(409).json({ error: 'That bed was just taken. Please choose another.' });
+            }
+        } else if (beds.some(x => x.isOccupied || x.boarderId || x.isReserved)) {
+            return res.status(409).json({ error: 'This room is no longer fully available for an Entire Room reservation.' });
+        }
+
+        const nowIso = new Date().toISOString();
+        const reservation = {
+            id: 'RES-' + Date.now(),
+            type,
+            occupancyType: type === 'room' ? 'entire_room' : 'bed',
+            scope: type,
+            reservationType: type === 'room' ? 'Entire Room' : 'Bed Space',
+            roomId: room.id,
+            bedNo: type === 'room' ? null : String(b.bedNo),
+            name, contact, email,
+            date, time, expDate: '', expTime: '',
+            deposit: 0,
+            method: 'GCash', paymentMethod: 'GCash',
+            paymentReference: '', reference: '',
+            status: RESERVATION_STATUS.PENDING,
+            approvalStatus: 'Pending',
+            approved: false, isActive: false, active: false,
+            checkedIn: false, checkInStatus: 'Not Checked-in',
+            lifecycleStage: 'Pending Approval',
+            canCheckIn: false, canCancel: true,
+            paymentStatus: 'Pending Verification',
+            paymentVerified: false,
+            reservationCredit: 0,
+            boarderId: null, payerId: null,
+            source: 'tenant-portal',
+            createdAt: nowIso.slice(0, 19).replace('T', ' '),
+            createdAtIso: nowIso,
+            lastStatusChangeAt: nowIso
+        };
+
+        if (type === 'bed') { bed.isReserved = true; bed.reservationId = reservation.id; }
+        else beds.forEach(x => { x.isReserved = true; x.reservationId = reservation.id; });
+
+        db.reservations = Array.isArray(db.reservations) ? db.reservations : [];
+        db.reservations.push(reservation);
+        normalizeReservationLifecycle(db);
+        reconcileEntireRoomState(db);
+        writeStorageAtomic(db);
+        appendAuditEntry('Tenant Portal', 'Reservation ' + reservation.id + ' submitted for ' +
+            (room.roomName || room.id) + (reservation.bedNo ? ' bed ' + reservation.bedNo : ' (Entire Room)'), req);
+
+        // Confirmation email — existing backend template + White Label signature.
+        try {
+            const tpl = tplReservationConfirmation(db, Object.assign({}, reservation, {
+                roomNumber: room.roomName || ('Room ' + room.roomNumber),
+                roomName: room.roomName || ('Room ' + room.roomNumber),
+                statusNotice: 'Your reservation is currently: PENDING ADMIN APPROVAL. Your room is NOT yet confirmed. ' +
+                    'Upload your GCash receipt in the portal chat — it is verified automatically. ' +
+                    'Once approved, your Official Receipt is generated and emailed to you immediately.'
+            }));
+            sendEmailWithRetry({
+                to: reservation.email, subject: tpl.subject, html: tpl.html,
+                type: 'Reservation Confirmation', config: db.emailConfig, settings: db.settings
+            }).catch(() => {});
+        } catch (_) {}
+
+        res.status(201).json({ success: true, reservation: tenantSanitizeReservation(db, reservation) });
+    } catch (e) { res.status(500).json({ error: 'Reservation failed.', details: e.message }); }
+});
+
+/** Status of the tenant's OWN reservation (used to resume the messenger). */
+app.get('/api/tenant/reservations/:id', (req, res) => {
+    try {
+        const db = readStorage();
+        try { normalizeReservationLifecycle(db); } catch (_) {}
+        const r = (db.reservations || []).find(x => String(x.id) === String(req.params.id));
+        if (!r) return res.status(404).json({ error: 'Reservation not found.' });
+        res.json({ reservation: tenantSanitizeReservation(db, r) });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+
+
+
+
+/* ====================================================================
  * STARTUP
  * ==================================================================== */
 function startServer() {
