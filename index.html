@@ -1813,16 +1813,10 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             // REQUEST 3: Transfer fees are recorded as official income and must
             // appear in Income & Payment Report, Dashboard total, and all
             // financial summaries.
-            return bhmsData.transactions.filter(t => {
-                if (!t) return false;
-                if (t.void === true || t.status === 'Void') return false;
-                // Backend SSOT: every Official-Receipt-backed collection is
-                // flagged isIncome by server.js (Reservation Fees included).
-                if (t.isIncome === true) return true;
-                if (t.isIncome === false) return false;
-                return t.type === 'Payment' ||
-                       (t.type === 'Transfer' && (parseFloat(t.amount) || 0) > 0);
-            });
+            return bhmsData.transactions.filter(t =>
+                t.type === 'Payment' ||
+                (t.type === 'Transfer' && (parseFloat(t.amount) || 0) > 0)
+            );
         }
 
         function renderDashboard() {
@@ -2342,18 +2336,6 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             if (resId) {
                 let linkedRes = bhmsData.reservations.find(r => r.id === resId);
                 window.__ciResCredit = getReservationFeeCredit(linkedRes);
-                // Backend SSOT refresh: the authoritative credit comes from the
-                // Official Receipt Archive, not from any local assumption.
-                (async () => {
-                    try {
-                        const authoritative = await window.fetchReservationCredit(linkedRes);
-                        if (typeof authoritative === 'number' && authoritative !== window.__ciResCredit) {
-                            window.__ciResCredit = authoritative;
-                            if (linkedRes) linkedRes.reservationCredit = authoritative;
-                            renderCheckInFeeSummary();
-                        }
-                    } catch (_) {}
-                })();
                 const notice = document.createElement('div');
                 notice.id = 'ci-res-fee-notice';
                 notice.className = 'col-span-2 p-3 bg-emerald-50 border border-emerald-300 rounded-lg mb-3 text-xs text-emerald-900';
@@ -2538,31 +2520,9 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
          * ========================================================== */
         window.getReservationFeeCredit = function(res) {
             if (!res) return 0;
-            // Consumed already? The backend flag (creditApplied) is authoritative;
-            // feeCreditApplied is the legacy Admin-Portal mirror of the same fact.
-            if (res.creditApplied || res.feeCreditApplied) return 0;
-            // SSOT: the credit is the amount backed by LIVE Official Receipts
-            // (server.js -> syncReservationCreditFromOfficialReceipts). It is
-            // populated for BOTH Tenant-Portal and Admin-created reservations.
-            const fromOR = parseFloat(res.reservationCredit || 0) || 0;
-            if (fromOR > 0) return fromOR;
-            // Legacy fallback: Admin-encoded reservations stored the fee in `deposit`.
-            const amt = parseFloat(res.deposit || 0) || 0;
-            return amt > 0 ? amt : 0;
-        };
-
-        /* Authoritative backend read used by the Check-In modal. Falls back to
-         * the locally synced reservation record if the API is unreachable. */
-        window.fetchReservationCredit = async function(res, rent, deposit) {
-            if (!res) return 0;
-            try {
-                const r = await fetch('/api/reservations/' + encodeURIComponent(res.id) + '/payment-summary');
-                if (r.ok) {
-                    const j = await r.json();
-                    if (j && typeof j.availableCredit === 'number') return j.availableCredit;
-                }
-            } catch (_) {}
-            return window.getReservationFeeCredit(res);
+            if (res.feeCreditApplied) return 0;          // already consumed once
+            const amt = parseFloat(res.deposit || 0);
+            return (isFinite(amt) && amt > 0) ? amt : 0;
         };
 
         /* Computes the complete check-in financial breakdown. */
@@ -2631,10 +2591,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             // === RESERVATION FEE CREDIT (computed BEFORE payment validation) ===
             // Room Rent + Security Deposit = Total Check-in Charges
             // Less: Reservation Fee already paid  =>  Remaining Amount Due
-            // Use the backend-refreshed credit displayed in the modal so the
-            // saved computation always equals what the Admin approved on screen.
-            const resCredit = (typeof window.__ciResCredit === 'number' && window.__ciResCredit > 0)
-                ? window.__ciResCredit : getReservationFeeCredit(linkedRes);
+            const resCredit = getReservationFeeCredit(linkedRes);
             const ciCalc = computeCheckInCharges(newBoarder.rentRate, newBoarder.deposit, resCredit);
 
             // === NEW: capture Payment Method + Reference Number ===
@@ -2706,7 +2663,6 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
                 newBoarder.reservationFeeCredit = ciCalc.credit;
                 if (resCredit > 0) {
                     linkedRes.feeCreditApplied   = true;   // consumed — cannot be reused
-                    linkedRes.creditApplied      = true;   // backend SSOT flag (server.js)
                     linkedRes.feeCreditAppliedTo = newBoarder.id;
                     linkedRes.feeCreditAmount    = ciCalc.credit;
                     linkedRes.feeCreditAppliedAt = getFormattedDateTime(new Date());
