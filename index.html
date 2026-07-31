@@ -9,6 +9,52 @@
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <script>
+/* ====================================================================
+ * RESERVATION LIFECYCLE SSOT (client mirror of server.js)
+ * --------------------------------------------------------------------
+ * The backend is the Single Source of Truth. This mirror guarantees the
+ * UI never invents its own definition of "active reservation", so a
+ * reservation created in the Tenant Portal behaves EXACTLY like one
+ * created in the Admin Portal.
+ * ==================================================================== */
+window.RESERVATION_STATUS = { PENDING:'Pending', ACTIVE:'Active', CHECKED_IN:'Checked-in',
+  CANCELLED:'Cancelled', EXPIRED:'Expired', REJECTED:'Rejected', COMPLETED:'Completed' };
+window.RES_STATUS_ALIASES = {
+  'active':'Active','approved':'Active','confirmed':'Active','reserved':'Active','verified':'Active',
+  'paid':'Active','payment verified':'Active','approved - active':'Active',
+  'pending':'Pending','pending approval':'Pending','pending admin approval':'Pending',
+  'pending verification':'Pending','awaiting approval':'Pending','awaiting review':'Pending',
+  'submitted':'Pending','for approval':'Pending',
+  'checked-in':'Checked-in','checked in':'Checked-in','checkedin':'Checked-in',
+  'cancelled':'Cancelled','canceled':'Cancelled','void':'Cancelled',
+  'expired':'Expired','rejected':'Rejected','declined':'Rejected',
+  'completed':'Completed','checked-out':'Completed'
+};
+window.RES_TERMINAL_STATUSES = ['Cancelled','Expired','Rejected','Completed'];
+window.RES_CANON_STATUS = function(r){
+  if(!r) return 'Pending';
+  var raw = String(r.status == null ? '' : r.status).trim().toLowerCase();
+  var canon = window.RES_STATUS_ALIASES[raw];
+  if(!canon){
+    var appr = String(r.approvalStatus || '').trim().toLowerCase();
+    canon = appr === 'approved' ? 'Active' : (appr === 'rejected' ? 'Rejected' : 'Pending');
+  }
+  if(canon === 'Pending' && (String(r.approvalStatus||'').toLowerCase() === 'approved' ||
+     r.approved === true || r.paymentVerified === true)) canon = 'Active';
+  if(r.checkedIn === true || r.checkInStatus === 'Checked-in') canon = 'Checked-in';
+  return canon;
+};
+window.RES_IS_ACTIVE     = function(r){ return window.RES_CANON_STATUS(r) === 'Active'; };
+window.RES_IS_CHECKED_IN = function(r){ return window.RES_CANON_STATUS(r) === 'Checked-in'; };
+window.RES_IS_PENDING    = function(r){ return window.RES_CANON_STATUS(r) === 'Pending'; };
+window.RES_IS_LIVE       = function(r){ return window.RES_IS_ACTIVE(r) || window.RES_IS_CHECKED_IN(r); };
+window.RES_IS_ENTIRE     = function(r){ return !!r && (r.type === 'room' || r.occupancyType === 'entire_room' ||
+                                          r.reservationType === 'Entire Room' || r.scope === 'room'); };
+window.RES_CAN_CHECK_IN  = function(r){ return window.RES_IS_ACTIVE(r); };
+window.RES_CAN_CANCEL    = function(r){ return window.RES_IS_ACTIVE(r) || window.RES_IS_PENDING(r); };
+</script>
+
+<script>
 /* ==================== WHITE-LABEL AVATAR HELPER (v3.1) ====================
  * Generates a local, offline, brand-coloured initials avatar so the system
  * never depends on the external ui-avatars.com service and never leaks the
@@ -1360,7 +1406,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             let now = new Date();
 
             bhmsData.reservations.forEach(res => {
-                if(res.status === 'Active') {
+                if(window.RES_IS_ACTIVE(res)) {
                     let expDT = new Date(`${res.expDate}T${res.expTime}`);
                     if(now > expDT) {
                         res.status = 'Expired';
@@ -1463,7 +1509,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
                     || occ.entireReservation;
             }
             if (occ && typeof occ === 'object') return null;   // server says: none
-            return bhmsData.reservations.find(r => r.roomId == roomId && r.type === 'room' && (r.status === 'Active' || r.status === 'Checked-in'));
+            return bhmsData.reservations.find(r => r.roomId == roomId && r.type === 'room' && window.RES_IS_LIVE(r));
         }
         function isRoomLockedByEntireRes(roomId) {
             return !!getActiveEntireRoomRes(roomId);
@@ -1585,9 +1631,9 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             //   - Checked-in -> Fully Occupied (Red); all beds hidden/locked
             //   - Completed/Checked-out -> falls through to normal status
             const _entireRes = getActiveEntireRoomRes(room.id);
-            if(_entireRes && _entireRes.status === 'Checked-in') {
+            if(_entireRes && window.RES_IS_CHECKED_IN(_entireRes)) {
                 room.status = 'Fully Occupied';
-            } else if(_entireRes && _entireRes.status === 'Active') {
+            } else if(_entireRes && window.RES_IS_ACTIVE(_entireRes)) {
                 room.status = 'Reserved';
             } else if(occ === 0 && res === 0) { room.status = 'Available'; room.payerId = null; }
             else if(occ === 0 && res === room.capacity) room.status = 'Reserved';
@@ -1695,7 +1741,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
         }
         
         function updateBadges() {
-            let actRes = bhmsData.reservations.filter(r=>r.status==='Active').length;
+            let actRes = bhmsData.reservations.filter(r=>window.RES_IS_ACTIVE(r)).length;
             let bEl = document.getElementById('res-badge');
             if(actRes > 0) { bEl.innerText = actRes; bEl.classList.remove('hidden'); } else bEl.classList.add('hidden');
         }
@@ -1805,7 +1851,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             if (df) incomeRows = incomeRows.filter(t => inRange(t.date));
             let tIncome = incomeRows.reduce((sum, t) => sum + (parseFloat(t.amount) || 0), 0);
 
-            let activeRes = bhmsData.reservations.filter(r=>r.status==='Active');
+            let activeRes = bhmsData.reservations.filter(r=>window.RES_IS_ACTIVE(r));
             if (df) activeRes = activeRes.filter(r => inRange(r.date));
             let waitCount = bhmsData.waitingList.length;
             if (df && Array.isArray(bhmsData.waitingList)) {
@@ -2185,7 +2231,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             bedListEl.innerHTML = '';
 
             // REQUEST 1: Active entire-room res -> show check-in-payer CTA
-            if(entireRes && entireRes.status === 'Active' && !entireCheckedIn) {
+            if(entireRes && window.RES_IS_ACTIVE(entireRes) && !entireCheckedIn) {
                 bedListEl.innerHTML = `
                     <div class="border-2 border-blue-300 rounded-lg p-4 bg-blue-50 text-center">
                         <p class="text-blue-800 font-black uppercase text-sm mb-1"><i class="fa-solid fa-user-lock mr-2"></i>Entire Room Reserved</p>
@@ -2886,13 +2932,13 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             logs.forEach(r => {
                 let room = bhmsData.rooms.find(rm => rm.id == r.roomId);
                 let loc = room ? window.getOccupancyLabel(r, room.roomName) : '—';
-                let badgeClass = r.status === 'Active' ? 'bg-blue-100 text-blue-800'
+                let badgeClass = window.RES_IS_ACTIVE(r) ? 'bg-blue-100 text-blue-800'
                               : r.status === 'Cancelled' ? 'bg-red-100 text-red-800'
                               : r.status === 'Completed' ? 'bg-emerald-100 text-emerald-800'
                               : r.status === 'Checked-in' ? 'bg-indigo-100 text-indigo-800'
                               : 'bg-yellow-100 text-yellow-800';
                 let actionCell = `<span class="px-2 py-1 rounded text-[10px] font-bold uppercase ${badgeClass}">${r.status}</span>`;
-                if (r.status === 'Active') {
+                if (window.RES_IS_ACTIVE(r)) {
                     const infoBtn = r.type === 'bed'
                         ? `<button type="button" onclick="showNoRefundPolicy(event)" class="ml-1 text-slate-400 hover:text-blue-600" title="No Return of Deposit Policy"><i class="fa-solid fa-circle-info"></i></button>`
                         : '';
@@ -6450,7 +6496,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
     try{
       const room = bhmsData.rooms.find(r=>String(r.id)===String(boarder.roomId));
       if(room){
-        const res = bhmsData.reservations.find(r => String(r.roomId)===String(room.id) && r.type==='room' && (r.status==='Checked-in' || r.status==='Active'));
+        const res = bhmsData.reservations.find(r => String(r.roomId)===String(room.id) && r.type==='room' && window.RES_IS_LIVE(r));
         if(res && boarder.isPayer) return 'entire_room';
       }
     }catch(_){}
@@ -6761,7 +6807,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
     // updateRoomStatus() would flip the old room straight back to Reserved/Occupied.
     let _migratedRes = null;
     (bhmsData.reservations||[]).forEach(r=>{
-      if(String(r.roomId)===String(oldRoom.id) && r.type==='room' && (r.status==='Active' || r.status==='Checked-in')){
+      if(String(r.roomId)===String(oldRoom.id) && r.type==='room' && window.RES_IS_LIVE(r)){
         const isOwnersRecord = (r.boarderId && r.boarderId===boarder.id) ||
                                (!!r.name && String(r.name).trim().toLowerCase() === String(boarder.name||'').trim().toLowerCase());
         if(isOwnersRecord && !_migratedRes){
@@ -7977,9 +8023,20 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
       var why = blockEntire(room);
       if(why){ toast('Entire Room Check-In blocked \u2014 ' + why); return; }
     } else {
-      var res = (bhmsData.reservations||[]).find(function(r){ return r.id === resId; });
-      if(!res || !(res.type === 'room' || res.occupancyType === 'entire_room')){ toast('Invalid Entire Room reservation.'); return; }
-      if(res.status !== 'Active'){ toast('This reservation is no longer active.'); return; }
+      var res = (bhmsData.reservations||[]).find(function(r){ return String(r.id) === String(resId); });
+      if(!res || !window.RES_IS_ENTIRE(res)){ toast('Invalid Entire Room reservation.'); return; }
+      /* SSOT: the SAME lifecycle rule the backend Check-In API applies, so a
+         Tenant-Portal reservation is never rejected here as "inactive". */
+      if(window.RES_IS_CHECKED_IN(res)){ toast('This reservation is already checked in.'); return; }
+      if(window.RES_IS_PENDING(res)){ toast('This reservation is still awaiting Admin approval.'); return; }
+      if(!window.RES_CAN_CHECK_IN(res)){ toast('This reservation is ' + window.RES_CANON_STATUS(res).toLowerCase() + '.'); return; }
+      /* Confirm against the backend gate (non-blocking, authoritative log). */
+      try{
+        fetch('/api/reservations/' + encodeURIComponent(res.id) + '/check-in-eligibility')
+          .then(function(x){ return x.json(); })
+          .then(function(g){ if(g && g.ok === false) console.warn('[SSOT] check-in gate:', g.code, g.reason); })
+          .catch(function(){});
+      }catch(_){}
     }
     resetFormChrome();
     CTX = { mode:'entire_checkin', roomId: room.id, bedNo: room.beds[0].bedNo, resId: resId || null };
