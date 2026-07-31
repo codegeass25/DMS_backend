@@ -905,6 +905,24 @@ function normalizeStructure(data) {
     // ---- Persistent user directory (mirrors client localStorage so profile
     //      photos & user records survive browser/server restarts) ----
     v.users = Array.isArray(v.users) ? v.users : [];
+    /* GUEST PORTAL — the default Guest account is seeded automatically on every
+     * load/write so the Guest role always resolves against a real, persisted
+     * user record. No manual database editing is ever required. */
+    (function ensureGuestUser() {
+        const idx = v.users.findIndex(u => String((u && u.username) || '').toLowerCase() === 'guest');
+        if (idx === -1) {
+            v.users.push({
+                id: 'u_guest', fullName: 'Guest User', username: 'guest', email: '', phone: '',
+                role: GUEST_ROLE, status: 'Active', pwHash: '', avatar: '',
+                lastLogin: null, created: new Date().toISOString(), system: true
+            });
+        } else {
+            // The Guest account may never be escalated or disabled by a sync.
+            v.users[idx].role = GUEST_ROLE;
+            v.users[idx].status = 'Active';
+            v.users[idx].system = true;
+        }
+    })();
     if (!Array.isArray(v.settings.reminderSchedule) || !v.settings.reminderSchedule.length) {
         v.settings.reminderSchedule = DEFAULT_SETTINGS.reminderSchedule.slice();
     }
