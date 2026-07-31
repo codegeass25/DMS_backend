@@ -1190,6 +1190,14 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
         }
 
         async function saveData() {
+            // GUEST: the snapshot is a filtered, partial view of the database.
+            // Never cache it locally (it would poison the next admin session);
+            // the server merges guest reservations onto its own record set.
+            if (window.isGuestUser && window.isGuestUser()) {
+                scheduleServerSync();
+                try { refreshAllViews(); } catch (_) {}
+                return;
+            }
             try {
                 localStorage.setItem('mdms_system_data_v1', JSON.stringify(bhmsData));
             } catch (error) {
@@ -3714,7 +3722,10 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
   const ROLES={
     'Super Administrator':{color:'#7c3aed',perms:'*'},
     'Administrator':{color:'#2563eb',perms:['dashboard','map','reservations','boarders','formerBoarders','billing','maintenance','reports','emailLogs','settings']},
-    'Staff':{color:'#059669',perms:['dashboard','map','reservations','boarders','formerBoarders','billing','maintenance','reports']}
+    'Staff':{color:'#059669',perms:['dashboard','map','reservations','boarders','formerBoarders','billing','maintenance','reports']},
+    // GUEST — public visitor. Sees ONLY the existing Dormitory Map, rendered by
+    // the exact same component, filtered by role (see GUEST PORTAL layer).
+    'Guest':{color:'#0d9488',perms:['map']}
   };
   window.MDMS_ROLES = Object.keys(ROLES); // Viewer role permanently removed
   async function sha(t){const b=new TextEncoder().encode(t);const h=await crypto.subtle.digest('SHA-256',b);return Array.from(new Uint8Array(h)).map(x=>x.toString(16).padStart(2,'0')).join('');}
@@ -3730,7 +3741,8 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
   const ROLE_PERMISSIONS={
     "Super Administrator":{userManagement:"FULL",  systemSettings:"FULL",  reservations:"FULL",billing:"FULL",maintenance:"FULL",reports:"FULL",resetDatabase:"FULL",  deleteRecords:"FULL",whiteLabel:"FULL",  emailConfig:"FULL",  receiptArchive:"FULL",  roomInventory:"FULL",  roomSettings:"FULL"},
     "Administrator":     {userManagement:"FULL",  systemSettings:"FULL",  reservations:"FULL",billing:"FULL",maintenance:"FULL",reports:"FULL",resetDatabase:"HIDDEN",deleteRecords:"FULL",whiteLabel:"HIDDEN",emailConfig:"HIDDEN",receiptArchive:"FULL",  roomInventory:"FULL",  roomSettings:"FULL"},
-    "Staff":             {userManagement:"HIDDEN",systemSettings:"HIDDEN",reservations:"FULL",billing:"RW",  maintenance:"FULL",reports:"RO",  resetDatabase:"HIDDEN",deleteRecords:"HIDDEN",whiteLabel:"HIDDEN",emailConfig:"HIDDEN",receiptArchive:"HIDDEN",roomInventory:"HIDDEN",roomSettings:"HIDDEN"}
+    "Staff":             {userManagement:"HIDDEN",systemSettings:"HIDDEN",reservations:"FULL",billing:"RW",  maintenance:"FULL",reports:"RO",  resetDatabase:"HIDDEN",deleteRecords:"HIDDEN",whiteLabel:"HIDDEN",emailConfig:"HIDDEN",receiptArchive:"HIDDEN",roomInventory:"HIDDEN",roomSettings:"HIDDEN"},
+    "Guest":             {userManagement:"HIDDEN",systemSettings:"HIDDEN",reservations:"RW",  billing:"HIDDEN",maintenance:"HIDDEN",reports:"HIDDEN",resetDatabase:"HIDDEN",deleteRecords:"HIDDEN",whiteLabel:"HIDDEN",emailConfig:"HIDDEN",receiptArchive:"HIDDEN",roomInventory:"HIDDEN",roomSettings:"HIDDEN"}
   };
   // Map nav view IDs -> permission module. Views not in the map are always available to any signed-in user.
   const NAV_MODULE_MAP={reservations:"reservations",billing:"billing",maintenance:"maintenance",reports:"reports",settings:"systemSettings",userManagement:"userManagement",receiptArchive:"receiptArchive"};
@@ -8758,6 +8770,9 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
   const POLL_MS = 4000;
   const el = id => document.getElementById(id);
   const S = { threads:[], sel:null, since:null, open:false, unread:0, q:'' };
+  /* GUEST PORTAL: the very same messenger, restricted to receipt upload. */
+  const isGuest = () => !!(window.isGuestUser && window.isGuestUser());
+  const myRole  = () => isGuest() ? 'tenant' : 'admin';
   const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const fmt = iso => { try { return new Date(iso).toLocaleString([], {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'}); } catch(_) { return ''; } };
   const money = n => (window.Branding && Branding.money) ? Branding.money(n) : ('' + n);
@@ -8778,7 +8793,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
 
   function receiptCard(r){
     const f = (r.ocr && r.ocr.fields) || {};
-    const pending = r.adminStatus === 'Awaiting Review';
+    const pending = r.adminStatus === 'Awaiting Review' && !isGuest();
     return '<div class="rcpt" data-rcpt="' + esc(r.id) + '">' +
       '<div class="flex items-center gap-2"><b>GCash Receipt</b>' + statusChip(r.verificationStatus) +
         '<span class="ml-auto text-[10px] text-slate-400">OCR ' + Math.round((r.confidence || 0) * 100) + '%</span></div>' +
@@ -8831,6 +8846,36 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
   }
 
   async function refreshThreads(){
+    /* GUEST: no conversation directory. The guest's own thread is opened
+     * through the SAME /api/chat/thread endpoint the tenant portal uses, and
+     * only while the reservation is Awaiting Payment. */
+    if (isGuest()){
+      try {
+        const mine = (window.guestAwaitingReservations ? window.guestAwaitingReservations() : []);
+        const out = [];
+        for (const r of mine){
+          const j = await jf('/api/chat/thread', { method:'POST', body: JSON.stringify({ reservationId:r.id, name:r.name, email:r.email, contact:r.contact }) });
+          if (j && j.thread) out.push(j.thread);
+        }
+        S.threads = out;
+        el('adm-chat-badge').style.display = 'none';
+        const st = el('adm-chat-stats'); if (st) st.textContent = out.length ? 'Upload your payment receipt for automatic verification.' : '';
+        renderThreads();
+        if (out.length){
+          if (!S.sel || !out.some(t => String(t.id) === String(S.sel.id))) await select(out[0].id);
+          if (!S.open) el('adm-chat-fab').style.display = 'grid';
+        } else {
+          S.sel = null;
+          el('adm-chat-fab').style.display = 'none';
+          el('adm-chat').classList.remove('open');
+          S.open = false;
+        }
+      } catch(_){
+        S.threads = []; S.sel = null;
+        el('adm-chat-fab').style.display = 'none';
+      }
+      return;
+    }
     try {
       const j = await jf('/api/chat/threads' + (S.q ? '?q=' + encodeURIComponent(S.q) : ''));
       S.threads = j.threads;
@@ -8846,12 +8891,17 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
   async function loadMessages(replace){
     if (!S.sel) return;
     try {
-      const j = await jf('/api/chat/messages?role=admin&threadId=' + encodeURIComponent(S.sel.id) + (replace || !S.since ? '' : '&since=' + encodeURIComponent(S.since)));
+      const j = await jf('/api/chat/messages?role=' + myRole() + '&threadId=' + encodeURIComponent(S.sel.id) + (replace || !S.since ? '' : '&since=' + encodeURIComponent(S.since)));
       S.sel = j.thread;
       const body = el('adm-chat-body');
       if (replace || !S.since) body.innerHTML = '';
+      // GUEST: historical/general conversation is hidden — only the receipt
+      // pipeline (uploads, OCR results, system confirmations) is rendered.
+      const _msgs = isGuest()
+        ? j.messages.filter(m => m.role === 'system' || m.kind === 'ocr' || m.kind === 'receipt' || (m.attachment && m.attachment.path))
+        : j.messages;
       if (j.messages.length){
-        body.insertAdjacentHTML('beforeend', j.messages.map(m => bubble(m, j.receipts)).join(''));
+        if (_msgs.length) body.insertAdjacentHTML('beforeend', _msgs.map(m => bubble(m, j.receipts)).join(''));
         S.since = j.messages[j.messages.length - 1].at;
         body.scrollTop = body.scrollHeight;
         bindCards();
@@ -8859,7 +8909,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
       el('adm-chat-meta').textContent = j.thread.reservationId + ' · ' + j.thread.reservationStatus +
         (j.thread.reservationCredit > 0 ? ' · Reservation Credit ' + money(j.thread.reservationCredit) : '') +
         (j.thread.tenantOnline ? ' · online' : '');
-      if (S.open) jf('/api/chat/read', { method:'POST', body: JSON.stringify({ threadId: S.sel.id, role:'admin' }) }).catch(()=>{});
+      if (S.open) jf('/api/chat/read', { method:'POST', body: JSON.stringify({ threadId: S.sel.id, role: myRole() }) }).catch(()=>{});
     } catch(_){}
   }
 
@@ -8928,6 +8978,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
   }
 
   async function send(){
+    if (isGuest()) return; // Guests have no text chat / general messaging.
     const inp = el('adm-chat-input');
     const text = inp.value.trim();
     if (!text || !S.sel) return;
@@ -8942,7 +8993,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
     const f = e.target.files[0]; if (!f || !S.sel) return;
     const fr = new FileReader();
     fr.onload = async () => {
-      try { await jf('/api/chat/message', { method:'POST', body: JSON.stringify({ threadId: S.sel.id, role:'admin', text:'', attachment:{ dataUrl: fr.result, name: f.name, mime: f.type } }) }); await loadMessages(false); }
+      try { await jf('/api/chat/message', { method:'POST', body: JSON.stringify({ threadId: S.sel.id, role: myRole(), text:'', attachment:{ dataUrl: fr.result, name: f.name, mime: f.type } }) }); await loadMessages(false); }
       catch(err){ alert(err.message); }
     };
     fr.readAsDataURL(f); e.target.value = '';
@@ -9062,7 +9113,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
   el('adm-chat-min').onclick = () => setMinimized(!el('adm-chat').classList.contains('minimized'));
 
 
-  window.AdminChat = { open, close, refresh: refreshThreads, openReservation(resId){
+  window.AdminChat = { open, close, select, refresh: refreshThreads, openReservation(resId){
     open();
     const t = S.threads.find(x => String(x.reservationId) === String(resId));
     if (t) select(t.id);
@@ -9074,6 +9125,220 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
     if (S.open && S.sel) loadMessages(false);
   }, POLL_MS);
   refreshThreads();
+})();
+</script>
+
+
+<style id="guest-portal-css">
+/* ==================== GUEST PORTAL — ROLE-BASED UI FILTERING ====================
+ * No new markup, no duplicated map, no duplicated chat. The Guest view is the
+ * SAME Dormitory Map with restricted controls hidden by role.
+ * ============================================================================= */
+body.role-guest [data-guest-hide]{display:none!important}
+body.role-guest .nav-link:not([data-target="map"]){display:none!important}
+body.role-guest #umgmt-card{display:none!important}
+body.role-guest [data-sa-only]{display:none!important}
+/* The tenant messenger is reused as-is; guests only get the upload lane. */
+body.role-guest #adm-chat-list{display:none!important}
+body.role-guest #adm-chat{grid-template-columns:1fr!important}
+body.role-guest #adm-chat-input,
+body.role-guest #adm-chat-send,
+body.role-guest #adm-chat-back{display:none!important}
+body.role-guest #adm-chat-foot::after{content:"Upload your payment receipt image (OCR verification is automatic).";font-size:.7rem;color:#64748b;align-self:center}
+</style>
+<script>
+/* =====================================================================
+ * GUEST PORTAL LAYER
+ * ---------------------------------------------------------------------
+ * The Guest experience is produced ONLY by filtering the existing UI:
+ *   - the SAME renderMap()/_renderRoomCard()/getRoomOccupancy() pipeline
+ *   - the SAME #roomDetailsModal
+ *   - the SAME openReservationModal()/saveReservation() workflow
+ *   - the SAME messenger component (#adm-chat) used for tenant receipts
+ *   - the SAME /api endpoints (server-side field filtering, see server.js)
+ * Nothing is recomputed and nothing is duplicated here.
+ * ===================================================================== */
+(function(){
+  const LS_SESSION = 'mdms_session_v1';
+  const sess = () => { try { return JSON.parse(localStorage.getItem(LS_SESSION) || 'null'); } catch(_){ return null; } };
+  const esc  = v => String(v == null ? '' : v).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const peso = n => { try { return (window.Branding && Branding.money) ? Branding.money(n) : ('\u20B1' + Number(n || 0).toLocaleString()); } catch(_){ return '\u20B1' + (n || 0); } };
+
+  window.isGuestUser = function(){ const s = sess(); return !!(s && s.role === 'Guest'); };
+
+  /* ---- Reservations owned by this guest (the server already filters them) ---- */
+  window.guestReservations = function(){
+    if (!window.isGuestUser()) return [];
+    return ((window.bhmsData && window.bhmsData.reservations) || []).slice();
+  };
+  window.isAwaitingPayment = function(r){
+    if (!r) return false;
+    if (r.awaitingPayment) return true;
+    if (String(r.status) === 'Awaiting Payment') return true;
+    if (String(r.paymentStatus || '') === 'Awaiting Payment') return true;
+    return !r.paymentVerified && (String(r.status) === 'Active' || String(r.status) === 'Pending');
+  };
+  window.guestAwaitingReservations = function(){
+    return window.guestReservations().filter(window.isAwaitingPayment);
+  };
+
+  /* ---- Navigation: a guest only ever reaches the Dormitory Map ---- */
+  const _can = window.mdmsCanAccess;
+  window.mdmsCanAccess = function(view){
+    if (window.isGuestUser()) return view === 'map';
+    return _can ? _can.apply(this, arguments) : true;
+  };
+  const _switch = window.switchView;
+  window.switchView = function(view){
+    if (window.isGuestUser() && view !== 'map') return _switch.call(this, 'map');
+    return _switch.apply(this, arguments);
+  };
+
+  /* ---- Room cards: identical card, restricted call-to-action ---- */
+  const _card = window._renderRoomCard;
+  window._renderRoomCard = function(room, statusMeta, floorName){
+    let html = _card.apply(this, arguments);
+    if (!window.isGuestUser()) return html;
+    // Same markup, same animations/hover/progress — only the admin CTA changes.
+    html = html.replace('<i class="fa-solid fa-plus-circle"></i> Check-In',
+                        '<i class="fa-solid fa-calendar-check"></i> Reserve');
+    return html;
+  };
+
+  /* ---- Room modal: same modal, sensitive rows replaced by status only ---- */
+  function guestRoomModal(roomId){
+    const room = ((window.bhmsData && window.bhmsData.rooms) || []).find(r => String(r.id) === String(roomId));
+    if (!room) return;
+    // Occupancy comes straight from the shared SSOT — never recalculated.
+    const o = window.getRoomOccupancy(room);
+    const sub = document.getElementById('rd-subtitle');
+    if (sub) sub.textContent = 'Availability \u00B7 ' + (o.status || room.status || '');
+    const hdr = document.getElementById('rd-bed-header');
+    if (hdr){ hdr.classList.remove('hidden'); const h = hdr.querySelector('h4'); if (h) h.textContent = 'Bed Availability'; }
+    const warn = document.getElementById('rd-full-warning');
+    if (warn && !warn.classList.contains('hidden')){
+      warn.innerHTML = '<i class="fa-solid fa-circle-info text-xl"></i><div><p class="font-bold">This room is currently unavailable.</p><p class="text-xs">All bed spaces are occupied or reserved.</p></div>';
+    }
+    const rate = Number(room.monthlyRate || room.rate || room.price || 0);
+    const amen = [].concat(room.amenities || room.inventory || [])
+      .map(a => typeof a === 'string' ? a : ((a && (a.name || a.item || a.label)) || ''))
+      .filter(Boolean);
+    const cell = (label, value) =>
+      '<div><p class="text-[10px] uppercase font-bold text-gray-500 tracking-wider">' + label + '</p>' +
+      '<p class="font-black text-gray-800">' + value + '</p></div>';
+
+    let info = '<div id="rd-guest-info" class="bg-white border rounded-lg p-4 mb-4 grid grid-cols-2 gap-4 text-sm">' +
+      cell('Room Number', esc(room.roomName)) +
+      cell('Room Type', esc(room.type || 'Standard')) +
+      cell('Capacity', o.capacity + ' bed space' + (o.capacity === 1 ? '' : 's')) +
+      cell('Monthly Rate', peso(rate)) +
+      cell('Available Beds', '<span class="text-green-600">' + o.available + '</span>') +
+      cell('Occupied Beds', '<span class="text-red-600">' + o.occupied + '</span>') +
+      cell('Availability', esc(o.status || room.status || '')) +
+      cell('Reserved Beds', '<span class="text-blue-600">' + o.reserved + '</span>') +
+      '<div class="col-span-2"><p class="text-[10px] uppercase font-bold text-gray-500 tracking-wider">Amenities</p>' +
+      '<p class="text-gray-700">' + (amen.length ? amen.map(esc).join(' \u00B7 ') : 'Standard dormitory amenities') + '</p></div>' +
+      '</div>';
+
+    let rows = '';
+    if (o.entireRoom){
+      rows = '<div class="border-2 border-slate-200 rounded-lg p-4 bg-slate-50 text-center">' +
+             '<p class="font-black uppercase text-sm text-slate-700"><i class="fa-solid fa-lock mr-2"></i>Entire Room \u2014 ' + esc(o.status) + '</p>' +
+             '<p class="text-xs text-slate-500 mt-1">This room is rented as a single unit and is not open for bed-space booking.</p></div>';
+    } else {
+      (room.beds || []).forEach(b => {
+        const occupied = !!(b.isOccupied || b.boarderId);
+        const reserved = !occupied && !!b.isReserved;
+        const label = occupied ? 'Occupied' : (reserved ? 'Reserved' : 'Available');
+        const tone  = occupied ? ['border-gray-200','bg-white','text-gray-600','bg-gray-100','text-gray-700']
+                    : reserved ? ['border-blue-200','bg-blue-50','text-blue-700','bg-blue-100','text-blue-800']
+                               : ['border-dashed border-green-300','bg-green-50/50','text-green-700','bg-green-100','text-green-800'];
+        rows += '<div class="border ' + tone[0] + ' rounded-lg p-3 flex justify-between items-center ' + tone[1] + '">' +
+                  '<div class="flex items-center gap-3">' +
+                    '<div class="' + tone[3] + ' p-2 rounded text-center w-12"><p class="text-[10px] font-bold ' + tone[2] + '">BED</p>' +
+                    '<p class="font-black ' + tone[4] + '">' + esc(b.bedNo || b.number || '') + '</p></div>' +
+                    '<p class="font-bold text-xs uppercase tracking-wide ' + tone[2] + '">' + label + '</p>' +
+                  '</div></div>';
+      });
+      rows += '<div class="text-xs text-gray-500 pt-1"><b>' + o.occupied + '</b> occupied \u00B7 <b>' + o.reserved +
+              '</b> reserved \u00B7 <b>' + o.available + '</b> available</div>';
+    }
+
+    const list = document.getElementById('rd-bed-list');
+    if (list) list.innerHTML = info + rows;
+
+    // Reserve button — calls the EXISTING reservation workflow.
+    const modal = document.getElementById('roomDetailsModal');
+    const foot  = modal ? modal.querySelector('.px-6.py-4.border-t') : null;
+    if (foot){
+      let btn = document.getElementById('rd-guest-reserve');
+      if (!btn){
+        btn = document.createElement('button');
+        btn.id = 'rd-guest-reserve';
+        btn.className = 'px-6 py-2 rounded-lg font-bold text-white shadow mr-auto';
+        btn.style.background = 'var(--wl-primary,#1d4ed8)';
+        foot.insertBefore(btn, foot.firstChild);
+      }
+      const bookable = !o.locked && o.available > 0 && room.type !== 'Admin' && room.status !== 'Maintenance';
+      btn.innerHTML = '<i class="fa-solid fa-calendar-check mr-1"></i> ' + (bookable ? 'Reserve This Room' : 'Not Available');
+      btn.disabled = !bookable;
+      btn.style.opacity = bookable ? '1' : '.5';
+      btn.style.cursor = bookable ? 'pointer' : 'not-allowed';
+      btn.onclick = function(){
+        if (!bookable) return;
+        closeModal('roomDetailsModal');
+        openReservationModal(room.id);   // existing function, existing modal
+      };
+    }
+  }
+
+  const _openRoomDetails = window.openRoomDetails;
+  window.openRoomDetails = function(roomId){
+    const r = _openRoomDetails.apply(this, arguments);
+    if (window.isGuestUser()) { try { guestRoomModal(roomId); } catch(e){ console.warn('[Guest] modal filter', e); } }
+    else { const b = document.getElementById('rd-guest-reserve'); if (b) b.remove(); }
+    return r;
+  };
+
+  /* ---- Reservation modal: same modal + same saveReservation(), prefilled ---- */
+  const _openRes = window.openReservationModal;
+  window.openReservationModal = function(defaultRoomId){
+    const r = _openRes.apply(this, arguments);
+    if (window.isGuestUser()){
+      const s = sess() || {};
+      const ident = (window.bhmsData && window.bhmsData.guestIdentity) || {};
+      const nm = document.getElementById('res-name');
+      const em = document.getElementById('res-email');
+      if (nm && !nm.value) nm.value = ident.fullName || s.fullName || '';
+      if (em && !em.value) em.value = ident.email || '';
+    }
+    return r;
+  };
+
+  /* ---- Apply / refresh the guest chrome ---- */
+  function applyGuestUI(){
+    const g = window.isGuestUser();
+    document.body.classList.toggle('role-guest', g);
+    if (!g) return;
+    document.querySelectorAll('.nav-link').forEach(l => {
+      const li = l.parentNode; if (li && li.classList) li.classList.toggle('nav-hidden', l.dataset.target !== 'map');
+    });
+    const sub = document.querySelector('#map p.text-gray-500');
+    if (sub && sub.dataset.guestCopy !== '1'){
+      sub.textContent = 'Live availability \u00B7 click any room to view details and reserve.';
+      sub.dataset.guestCopy = '1';
+    }
+    const active = document.querySelector('.view-section.active');
+    if (active && active.id !== 'map' && typeof window.switchView === 'function') window.switchView('map');
+  }
+  window.applyGuestUI = applyGuestUI;
+
+  const _perms = window.mdmsApplyPerms;
+  window.mdmsApplyPerms = function(){ const r = _perms ? _perms.apply(this, arguments) : undefined; applyGuestUI(); return r; };
+
+  document.addEventListener('DOMContentLoaded', applyGuestUI);
+  setInterval(applyGuestUI, 1500);
+  applyGuestUI();
 })();
 </script>
 
