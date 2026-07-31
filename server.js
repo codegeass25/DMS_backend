@@ -865,8 +865,6 @@ function withOccupancy(db) {
         // Reservation credits are derived from the Official Receipt Archive and
         // must be refreshed before the portals read them.
         try { syncAllReservationCredits(db); } catch (_) {}
-        try { markIncomeTransactions(db); } catch (_) {}
-        try { reconcileCreditAppliedFlags(db); } catch (_) {}
         const map = computeOccupancyMap(db);
         (Array.isArray(db.rooms) ? db.rooms : []).forEach(room => {
             if (room) room.occupancy = map[String(room.id)] || null;
@@ -3945,95 +3943,6 @@ function syncReservationCreditFromOfficialReceipts(db, reservation) {
     return total;
 }
 
-/* ====================================================================
- * INCOME FLAGGING (SSOT for the Income & Payment Report)
- * --------------------------------------------------------------------
- * A transaction is income when actual money was collected. Every
- * Official-Receipt-backed collection (Reservation Fee included) qualifies.
- * Internal credit movements (Reservation Credit / Reservation Credit
- * Applied) are NOT income — the money was already counted when the
- * Official Receipt was issued, so counting them again would double the
- * report. This runs on every read, so historical rows are backfilled too.
- * ==================================================================== */
-const INCOME_TX_TYPES = [
-    'Payment', 'Reservation Fee', 'Reservation Payment', 'Reservation',
-    'Security Deposit', 'Check-in Payment', 'Monthly Rental', 'Utilities',
-    'Transfer Fee', 'Penalty', 'Miscellaneous Fee', 'Additional Charge',
-    'Manual Payment', 'Walk-in Payment', 'Office Payment'
-];
-const NON_INCOME_TX_TYPES = [
-    'Reservation Credit', 'Reservation Credit Applied', 'Bill', 'Charge', 'Invoice'
-];
-
-function markIncomeTransactions(db) {
-    const voidOrNumbers = new Set(
-        (Array.isArray(db.officialReceipts) ? db.officialReceipts : [])
-            .filter(o => o && o.status === 'Void')
-            .map(o => String(o.orNumber)));
-
-    (Array.isArray(db.transactions) ? db.transactions : []).forEach(t => {
-        if (!t || typeof t !== 'object') return;
-        const type = String(t.type || '');
-        if (NON_INCOME_TX_TYPES.includes(type)) { t.isIncome = false; return; }
-        if (t.orNumber && voidOrNumbers.has(String(t.orNumber))) { t.isIncome = false; return; }
-        if (t.officialReceiptId || t.orNumber) { t.isIncome = true; return; }
-        if (INCOME_TX_TYPES.includes(type)) { t.isIncome = true; return; }
-        if (type === 'Transfer' && Number(t.amount || 0) > 0) { t.isIncome = true; return; }
-        if (t.isIncome !== true) t.isIncome = false;
-    });
-    db.billingRecords = db.transactions;
-    return db;
-}
-
-/**
- * The one authoritative reservation payment summary. Receipt Archive,
- * Income & Payment Report, Reservation Details and the Check-In Financial
- * Computation all read THIS, never their own arithmetic.
- */
-function reservationPaymentSummary(db, reservation) {
-    if (!reservation) return null;
-    const ors = officialReceiptsForReservation(db, reservation.id);
-    const paid = ors.reduce((s, o) => s + (Number(o.amount) || 0), 0);
-    syncReservationCreditFromOfficialReceipts(db, reservation);
-    const applied = !!(reservation.creditApplied || reservation.feeCreditApplied);
-    return {
-        reservationId: reservation.id,
-        payerName: reservation.name || '',
-        payerEmail: reservation.email || '',
-        boarderId: reservation.boarderId || null,
-        totalPaid: paid,
-        availableCredit: applied ? 0 : paid,
-        creditApplied: applied,
-        creditAppliedAt: reservation.creditAppliedAt || reservation.feeCreditAppliedAt || null,
-        orNumbers: ors.map(o => o.orNumber),
-        officialReceiptIds: ors.map(o => o.id),
-        paymentReference: reservation.paymentReference || '',
-        source: 'Official Receipt Archive'
-    };
-}
-
-/** Keep the legacy Admin flag and the backend flag in lock-step. */
-function reconcileCreditAppliedFlags(db) {
-    (Array.isArray(db.reservations) ? db.reservations : []).forEach(r => {
-        if (!r) return;
-        if (r.creditApplied || r.feeCreditApplied) {
-            r.creditApplied = true;
-            r.feeCreditApplied = true;
-        }
-    });
-    return db;
-}
-
-/** Authoritative reservation payment summary endpoint. */
-app.get('/api/reservations/:id/payment-summary', (req, res) => {
-    try {
-        const db = ensureFinancialCollections(chatEnsure(readStorage()));
-        const r = (db.reservations || []).find(x => String(x.id) === String(req.params.id));
-        if (!r) return res.status(404).json({ error: 'Reservation not found.' });
-        res.json(reservationPaymentSummary(db, r));
-    } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
 /** Recompute every reservation credit — cheap, idempotent, always safe. */
 function syncAllReservationCredits(db) {
     (Array.isArray(db.reservations) ? db.reservations : [])
@@ -4592,8 +4501,6 @@ function logApprovedPaymentEverywhere(db, ctx) {
 
     const base = {
         idempotencyKey: key,
-        isIncome: true,
-        incomeSource: 'Official Receipt',
         orNumber: or.orNumber,
         officialReceiptId: or.id,
         date: (or.datePaid || or.issuedAt || new Date().toISOString()).split('T')[0],
