@@ -9,52 +9,6 @@
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <script>
-/* ====================================================================
- * RESERVATION LIFECYCLE SSOT (client mirror of server.js)
- * --------------------------------------------------------------------
- * The backend is the Single Source of Truth. This mirror guarantees the
- * UI never invents its own definition of "active reservation", so a
- * reservation created in the Tenant Portal behaves EXACTLY like one
- * created in the Admin Portal.
- * ==================================================================== */
-window.RESERVATION_STATUS = { PENDING:'Pending', ACTIVE:'Active', CHECKED_IN:'Checked-in',
-  CANCELLED:'Cancelled', EXPIRED:'Expired', REJECTED:'Rejected', COMPLETED:'Completed' };
-window.RES_STATUS_ALIASES = {
-  'active':'Active','approved':'Active','confirmed':'Active','reserved':'Active','verified':'Active',
-  'paid':'Active','payment verified':'Active','approved - active':'Active',
-  'pending':'Pending','pending approval':'Pending','pending admin approval':'Pending',
-  'pending verification':'Pending','awaiting approval':'Pending','awaiting review':'Pending',
-  'submitted':'Pending','for approval':'Pending',
-  'checked-in':'Checked-in','checked in':'Checked-in','checkedin':'Checked-in',
-  'cancelled':'Cancelled','canceled':'Cancelled','void':'Cancelled',
-  'expired':'Expired','rejected':'Rejected','declined':'Rejected',
-  'completed':'Completed','checked-out':'Completed'
-};
-window.RES_TERMINAL_STATUSES = ['Cancelled','Expired','Rejected','Completed'];
-window.RES_CANON_STATUS = function(r){
-  if(!r) return 'Pending';
-  var raw = String(r.status == null ? '' : r.status).trim().toLowerCase();
-  var canon = window.RES_STATUS_ALIASES[raw];
-  if(!canon){
-    var appr = String(r.approvalStatus || '').trim().toLowerCase();
-    canon = appr === 'approved' ? 'Active' : (appr === 'rejected' ? 'Rejected' : 'Pending');
-  }
-  if(canon === 'Pending' && (String(r.approvalStatus||'').toLowerCase() === 'approved' ||
-     r.approved === true || r.paymentVerified === true)) canon = 'Active';
-  if(r.checkedIn === true || r.checkInStatus === 'Checked-in') canon = 'Checked-in';
-  return canon;
-};
-window.RES_IS_ACTIVE     = function(r){ return window.RES_CANON_STATUS(r) === 'Active'; };
-window.RES_IS_CHECKED_IN = function(r){ return window.RES_CANON_STATUS(r) === 'Checked-in'; };
-window.RES_IS_PENDING    = function(r){ return window.RES_CANON_STATUS(r) === 'Pending'; };
-window.RES_IS_LIVE       = function(r){ return window.RES_IS_ACTIVE(r) || window.RES_IS_CHECKED_IN(r); };
-window.RES_IS_ENTIRE     = function(r){ return !!r && (r.type === 'room' || r.occupancyType === 'entire_room' ||
-                                          r.reservationType === 'Entire Room' || r.scope === 'room'); };
-window.RES_CAN_CHECK_IN  = function(r){ return window.RES_IS_ACTIVE(r); };
-window.RES_CAN_CANCEL    = function(r){ return window.RES_IS_ACTIVE(r) || window.RES_IS_PENDING(r); };
-</script>
-
-<script>
 /* ==================== WHITE-LABEL AVATAR HELPER (v3.1) ====================
  * Generates a local, offline, brand-coloured initials avatar so the system
  * never depends on the external ui-avatars.com service and never leaks the
@@ -1406,7 +1360,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             let now = new Date();
 
             bhmsData.reservations.forEach(res => {
-                if(window.RES_IS_ACTIVE(res)) {
+                if(res.status === 'Active') {
                     let expDT = new Date(`${res.expDate}T${res.expTime}`);
                     if(now > expDT) {
                         res.status = 'Expired';
@@ -1498,23 +1452,13 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
         });
 
 
-        // SINGLE SOURCE OF TRUTH: the backend decides what an "Entire Room
-        // Reservation" is (server.js -> computeRoomOccupancy). The portal only
-        // resolves the id it published; the local scan is an offline fallback.
+        // REQUEST 13: Helpers for Entire Room Reservation
         function getActiveEntireRoomRes(roomId) {
-            const room = (bhmsData.rooms || []).find(r => String(r.id) === String(roomId));
-            const occ = room && room.occupancy;
-            if (occ && occ.entireReservation) {
-                return (bhmsData.reservations || []).find(r => String(r.id) === String(occ.entireReservation.id))
-                    || occ.entireReservation;
-            }
-            if (occ && typeof occ === 'object') return null;   // server says: none
-            return bhmsData.reservations.find(r => r.roomId == roomId && r.type === 'room' && window.RES_IS_LIVE(r));
+            return bhmsData.reservations.find(r => r.roomId == roomId && r.type === 'room' && (r.status === 'Active' || r.status === 'Checked-in'));
         }
         function isRoomLockedByEntireRes(roomId) {
             return !!getActiveEntireRoomRes(roomId);
         }
-
 
         /* ================================================================
          * ENTIRE ROOM OCCUPANCY (FINAL FIX)
@@ -1631,9 +1575,9 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             //   - Checked-in -> Fully Occupied (Red); all beds hidden/locked
             //   - Completed/Checked-out -> falls through to normal status
             const _entireRes = getActiveEntireRoomRes(room.id);
-            if(_entireRes && window.RES_IS_CHECKED_IN(_entireRes)) {
+            if(_entireRes && _entireRes.status === 'Checked-in') {
                 room.status = 'Fully Occupied';
-            } else if(_entireRes && window.RES_IS_ACTIVE(_entireRes)) {
+            } else if(_entireRes && _entireRes.status === 'Active') {
                 room.status = 'Reserved';
             } else if(occ === 0 && res === 0) { room.status = 'Available'; room.payerId = null; }
             else if(occ === 0 && res === room.capacity) room.status = 'Reserved';
@@ -1741,7 +1685,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
         }
         
         function updateBadges() {
-            let actRes = bhmsData.reservations.filter(r=>window.RES_IS_ACTIVE(r)).length;
+            let actRes = bhmsData.reservations.filter(r=>r.status==='Active').length;
             let bEl = document.getElementById('res-badge');
             if(actRes > 0) { bEl.innerText = actRes; bEl.classList.remove('hidden'); } else bEl.classList.add('hidden');
         }
@@ -1851,7 +1795,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             if (df) incomeRows = incomeRows.filter(t => inRange(t.date));
             let tIncome = incomeRows.reduce((sum, t) => sum + (parseFloat(t.amount) || 0), 0);
 
-            let activeRes = bhmsData.reservations.filter(r=>window.RES_IS_ACTIVE(r));
+            let activeRes = bhmsData.reservations.filter(r=>r.status==='Active');
             if (df) activeRes = activeRes.filter(r => inRange(r.date));
             let waitCount = bhmsData.waitingList.length;
             if (df && Array.isArray(bhmsData.waitingList)) {
@@ -2231,7 +2175,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             bedListEl.innerHTML = '';
 
             // REQUEST 1: Active entire-room res -> show check-in-payer CTA
-            if(entireRes && window.RES_IS_ACTIVE(entireRes) && !entireCheckedIn) {
+            if(entireRes && entireRes.status === 'Active' && !entireCheckedIn) {
                 bedListEl.innerHTML = `
                     <div class="border-2 border-blue-300 rounded-lg p-4 bg-blue-50 text-center">
                         <p class="text-blue-800 font-black uppercase text-sm mb-1"><i class="fa-solid fa-user-lock mr-2"></i>Entire Room Reserved</p>
@@ -2932,13 +2876,13 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
             logs.forEach(r => {
                 let room = bhmsData.rooms.find(rm => rm.id == r.roomId);
                 let loc = room ? window.getOccupancyLabel(r, room.roomName) : '—';
-                let badgeClass = window.RES_IS_ACTIVE(r) ? 'bg-blue-100 text-blue-800'
+                let badgeClass = r.status === 'Active' ? 'bg-blue-100 text-blue-800'
                               : r.status === 'Cancelled' ? 'bg-red-100 text-red-800'
                               : r.status === 'Completed' ? 'bg-emerald-100 text-emerald-800'
                               : r.status === 'Checked-in' ? 'bg-indigo-100 text-indigo-800'
                               : 'bg-yellow-100 text-yellow-800';
                 let actionCell = `<span class="px-2 py-1 rounded text-[10px] font-bold uppercase ${badgeClass}">${r.status}</span>`;
-                if (window.RES_IS_ACTIVE(r)) {
+                if (r.status === 'Active') {
                     const infoBtn = r.type === 'bed'
                         ? `<button type="button" onclick="showNoRefundPolicy(event)" class="ml-1 text-slate-400 hover:text-blue-600" title="No Return of Deposit Policy"><i class="fa-solid fa-circle-info"></i></button>`
                         : '';
@@ -6496,7 +6440,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
     try{
       const room = bhmsData.rooms.find(r=>String(r.id)===String(boarder.roomId));
       if(room){
-        const res = bhmsData.reservations.find(r => String(r.roomId)===String(room.id) && r.type==='room' && window.RES_IS_LIVE(r));
+        const res = bhmsData.reservations.find(r => String(r.roomId)===String(room.id) && r.type==='room' && (r.status==='Checked-in' || r.status==='Active'));
         if(res && boarder.isPayer) return 'entire_room';
       }
     }catch(_){}
@@ -6807,7 +6751,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
     // updateRoomStatus() would flip the old room straight back to Reserved/Occupied.
     let _migratedRes = null;
     (bhmsData.reservations||[]).forEach(r=>{
-      if(String(r.roomId)===String(oldRoom.id) && r.type==='room' && window.RES_IS_LIVE(r)){
+      if(String(r.roomId)===String(oldRoom.id) && r.type==='room' && (r.status==='Active' || r.status==='Checked-in')){
         const isOwnersRecord = (r.boarderId && r.boarderId===boarder.id) ||
                                (!!r.name && String(r.name).trim().toLowerCase() === String(boarder.name||'').trim().toLowerCase());
         if(isOwnersRecord && !_migratedRes){
@@ -7562,57 +7506,34 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
 
   /* ---------- occupancy guards (mirrored by server.js) ---------- */
   function roomState(room){
-    // SSOT: server.js -> computeRoomOccupancy publishes the authoritative
-    // state (entireCheckedIn / entireReserved / bed flags + block reasons).
-    var occ = (room && room.occupancy && typeof room.occupancy === 'object')
-      ? room.occupancy
-      : (typeof window.getRoomOccupancy === 'function' ? window.getRoomOccupancy(room) : null);
-    var eres = entireRes(room.id);
-    if(occ && (occ.entireCheckedIn !== undefined || occ.mode)){
-      return {
-        occ: occ,
-        owner: occ.entireCheckedIn ? (entireOwner(room) || { id: occ.occupantId, name: occ.occupantName }) : null,
-        eres: (occ.entireReservation ? (eres || occ.entireReservation) : null),
-        entireCheckedIn: !!occ.entireCheckedIn,
-        entireReserved: !!occ.entireReserved,
-        bedOccupied: !!occ.bedOccupied,
-        bedReserved: !!occ.bedReserved,
-        blockEntireReason: occ.blockEntireReason || null,
-        blockBedReason: occ.blockBedReason || null
-      };
-    }
     var owner = entireOwner(room);
+    var eres  = entireRes(room.id);
     var entireCheckedIn = !!owner || !!(eres && eres.status === 'Checked-in');
-    var entireReserved  = !!eres && !entireCheckedIn;
+    var entireReserved  = !!(eres && eres.status === 'Active') && !entireCheckedIn;
     var bedOccupied = !entireCheckedIn && (room.beds||[]).some(function(b){ return b.isOccupied; });
     var bedReserved = !entireReserved && (room.beds||[]).some(function(b){ return b.isReserved; });
     return {
-      occ: occ, owner: owner, eres: eres,
+      owner: owner, eres: eres,
       entireCheckedIn: entireCheckedIn,
       entireReserved: entireReserved,
       bedOccupied: bedOccupied,
-      bedReserved: bedReserved,
-      blockEntireReason: null,
-      blockBedReason: null
+      bedReserved: bedReserved
     };
   }
-
-  // Why an ENTIRE ROOM action is not allowed (null = allowed) — backend reason wins.
+  // Why an ENTIRE ROOM action is not allowed (null = allowed)
   function blockEntire(room){
     if(!room || room.type === 'Admin' || !room.beds || !room.beds.length) return 'Invalid room.';
     var st = roomState(room);
-    if(st.blockEntireReason !== undefined && st.blockEntireReason !== null) return st.blockEntireReason;
     if(st.entireCheckedIn) return 'Room is already occupied as an Entire Room.';
     if(st.entireReserved)  return 'Room already has an active Entire Room reservation.';
     if(st.bedOccupied)     return 'Blocked \u2014 this room already has active Bed Space occupants.';
     if(st.bedReserved)     return 'Blocked \u2014 this room already has Bed Space reservations.';
     return null;
   }
-  // Why a BED SPACE action is not allowed (null = allowed) — backend reason wins.
+  // Why a BED SPACE action is not allowed (null = allowed)
   function blockBed(room, bedNo, allowResId){
     if(!room || room.type === 'Admin') return 'Invalid room.';
     var st = roomState(room);
-    if(st.blockBedReason) return st.blockBedReason;
     if(st.entireCheckedIn) return 'Room is occupied as an Entire Room \u2014 Bed Space transactions are blocked.';
     if(st.entireReserved)  return 'Room is reserved as an Entire Room \u2014 Bed Space transactions are blocked.';
     var bed = (room.beds||[]).find(function(b){ return String(b.bedNo)===String(bedNo); });
@@ -7621,7 +7542,6 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
     if(bed.isReserved && String(bed.reservationId||'') !== String(allowResId||'')) return 'Bed ' + bedNo + ' is already reserved.';
     return null;
   }
-
   window.MDMS_blockEntire = blockEntire;
   window.MDMS_blockBed    = blockBed;
 
@@ -7649,11 +7569,10 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
 
     var subtitle = document.getElementById('rd-subtitle');
     if(subtitle){
-      subtitle.innerText = occ.subtitle || (st.entireCheckedIn ? ('1 OCC \u00B7 ENTIRE ROOM')
+      subtitle.innerText = st.entireCheckedIn ? ('1 OCC \u00B7 ENTIRE ROOM')
         : st.entireReserved ? 'Entire Room Reserved'
-        : 'Occupancy Status');
+        : 'Occupancy Status';
     }
-
 
     var headerCounterEl = document.getElementById('rd-header-counter');
     var bedHeaderEl     = document.getElementById('rd-bed-header');
@@ -7662,18 +7581,16 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
     bedHeaderEl.classList.remove('hidden');
 
     if(st.entireCheckedIn){
-      var nm = occ.occupantName || (st.owner && st.owner.name) || (st.eres && st.eres.name) || 'Occupant';
+      var nm = (st.owner && st.owner.name) || (st.eres && st.eres.name) || 'Occupant';
       warningEl.classList.remove('hidden');
       warningEl.innerHTML = '<i class="fa-solid fa-user-check text-xl"></i><div><p class="font-bold">1 OCC \u2014 ENTIRE ROOM (Occupied).</p><p class="text-xs">Occupied by ' + nm + '. Individual bed cards are hidden and locked until check-out.</p></div>';
     } else if(st.entireReserved){
-      var _er = occ.entireReservation || st.eres || {};
       warningEl.classList.remove('hidden');
-      warningEl.innerHTML = '<i class="fa-solid fa-lock text-xl"></i><div><p class="font-bold">Entire Room Reservation (Active).</p><p class="text-xs">Reserved by ' + (_er.name || occ.occupantName || 'Reservation holder') + ' \u00B7 Expires ' + (_er.expDate||'') + ' ' + (_er.expTime||'') + '. Bed Space transactions are locked.</p></div>';
+      warningEl.innerHTML = '<i class="fa-solid fa-lock text-xl"></i><div><p class="font-bold">Entire Room Reservation (Active).</p><p class="text-xs">Reserved by ' + st.eres.name + ' \u00B7 Expires ' + (st.eres.expDate||'') + ' ' + (st.eres.expTime||'') + '. Bed Space transactions are locked.</p></div>';
     } else {
-      warningEl.classList.toggle('hidden', occ.status !== 'Fully Occupied' && occ.status !== 'Reserved');
+      warningEl.classList.toggle('hidden', room.status !== 'Fully Occupied' && room.status !== 'Reserved');
       warningEl.innerHTML = '<i class="fa-solid fa-circle-exclamation text-xl"></i><div><p class="font-bold">Room is Fully Occupied/Reserved.</p></div>';
     }
-
 
     /* ---------- ROOM-LEVEL ACTIONS (always above the bed list) ---------- */
     var why = blockEntire(room);
@@ -7711,22 +7628,14 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
 
     /* ---------- ENTIRE ROOM RESERVED — hide bed cards, offer check-in ---------- */
     if(st.entireReserved){
-      var er = occ.entireReservation || st.eres || {};
-      var credit = Number(er.reservationCredit || 0);
       bedListEl.innerHTML = actionsHtml +
         '<div class="border-2 border-blue-300 rounded-lg p-4 bg-blue-50 text-center">' +
           '<p class="text-blue-800 font-black uppercase text-sm mb-1"><i class="fa-solid fa-user-lock mr-2"></i>Entire Room Reserved</p>' +
-          '<p class="text-xs text-blue-700 mb-3">All ' + cap + ' bed spaces are reserved as ONE rentable unit for <b>' + (er.name || 'Reservation holder') + '</b>.</p>' +
-          (credit > 0
-            ? '<p class="text-[11px] text-emerald-700 font-bold mb-3"><i class="fa-solid fa-receipt mr-1"></i>Reservation Fee credit \u20B1' + credit.toLocaleString() +
-              ' (Official Receipt ' + ((er.reservationCreditOrNumbers && er.reservationCreditOrNumbers.join(', ')) || 'on file') +
-              ') will be deducted automatically at check-in.</p>'
-            : '') +
-          '<button onclick="openEntireRoomCheckIn(' + room.id + ', \'' + er.id + '\')" class="bg-blue-600 text-white px-4 py-2 rounded font-bold shadow hover:bg-blue-700 text-sm"><i class="fa-solid fa-right-to-bracket mr-1"></i>Check-In Entire Room Reservation</button>' +
-          '<div class="mt-3"><button onclick="cancelReservation(\'' + er.id + '\')" class="text-red-600 text-xs font-bold hover:underline">Cancel Entire Room Reservation</button>' +
+          '<p class="text-xs text-blue-700 mb-3">All ' + cap + ' bed spaces are reserved as ONE rentable unit for <b>' + st.eres.name + '</b>.</p>' +
+          '<button onclick="openEntireRoomCheckIn(' + room.id + ', \'' + st.eres.id + '\')" class="bg-blue-600 text-white px-4 py-2 rounded font-bold shadow hover:bg-blue-700 text-sm"><i class="fa-solid fa-right-to-bracket mr-1"></i>Check-In Entire Room Reservation</button>' +
+          '<div class="mt-3"><button onclick="cancelReservation(\'' + st.eres.id + '\')" class="text-red-600 text-xs font-bold hover:underline">Cancel Entire Room Reservation</button>' +
           '<button type="button" onclick="showNoRefundPolicy(event)" class="ml-2 text-slate-400 hover:text-blue-600" title="No Return of Deposit Policy"><i class="fa-solid fa-circle-info"></i></button></div>' +
         '</div>';
-
       document.getElementById('roomDetailsModal').classList.remove('hidden');
       return;
     }
@@ -8023,20 +7932,9 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
       var why = blockEntire(room);
       if(why){ toast('Entire Room Check-In blocked \u2014 ' + why); return; }
     } else {
-      var res = (bhmsData.reservations||[]).find(function(r){ return String(r.id) === String(resId); });
-      if(!res || !window.RES_IS_ENTIRE(res)){ toast('Invalid Entire Room reservation.'); return; }
-      /* SSOT: the SAME lifecycle rule the backend Check-In API applies, so a
-         Tenant-Portal reservation is never rejected here as "inactive". */
-      if(window.RES_IS_CHECKED_IN(res)){ toast('This reservation is already checked in.'); return; }
-      if(window.RES_IS_PENDING(res)){ toast('This reservation is still awaiting Admin approval.'); return; }
-      if(!window.RES_CAN_CHECK_IN(res)){ toast('This reservation is ' + window.RES_CANON_STATUS(res).toLowerCase() + '.'); return; }
-      /* Confirm against the backend gate (non-blocking, authoritative log). */
-      try{
-        fetch('/api/reservations/' + encodeURIComponent(res.id) + '/check-in-eligibility')
-          .then(function(x){ return x.json(); })
-          .then(function(g){ if(g && g.ok === false) console.warn('[SSOT] check-in gate:', g.code, g.reason); })
-          .catch(function(){});
-      }catch(_){}
+      var res = (bhmsData.reservations||[]).find(function(r){ return r.id === resId; });
+      if(!res || !(res.type === 'room' || res.occupancyType === 'entire_room')){ toast('Invalid Entire Room reservation.'); return; }
+      if(res.status !== 'Active'){ toast('This reservation is no longer active.'); return; }
     }
     resetFormChrome();
     CTX = { mode:'entire_checkin', roomId: room.id, bedNo: room.beds[0].bedNo, resId: resId || null };
@@ -8945,34 +8843,19 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
     } catch(_){}
   }
 
-  /* Chat scrolling: stay pinned to the newest message, but never yank the
-   * transcript away from an admin who scrolled up to read history. Images
-   * re-pin once they finish loading (they change the scroll height). */
-  function nearBottom(box){ return !box || (box.scrollHeight - box.scrollTop - box.clientHeight) < 120; }
-  function pin(box){
-    if (!box) return;
-    const go = () => { box.scrollTop = box.scrollHeight; };
-    go();
-    requestAnimationFrame(go);
-    box.querySelectorAll('img').forEach(img => { if (!img.complete) img.addEventListener('load', go, { once: true }); });
-  }
-  window.__admChatPin = pin;
-
   async function loadMessages(replace){
     if (!S.sel) return;
     try {
       const j = await jf('/api/chat/messages?role=admin&threadId=' + encodeURIComponent(S.sel.id) + (replace || !S.since ? '' : '&since=' + encodeURIComponent(S.since)));
       S.sel = j.thread;
       const body = el('adm-chat-body');
-      const stick = replace || !S.since || nearBottom(body);
       if (replace || !S.since) body.innerHTML = '';
       if (j.messages.length){
         body.insertAdjacentHTML('beforeend', j.messages.map(m => bubble(m, j.receipts)).join(''));
         S.since = j.messages[j.messages.length - 1].at;
-        if (stick) pin(body);
+        body.scrollTop = body.scrollHeight;
         bindCards();
       }
-
       el('adm-chat-meta').textContent = j.thread.reservationId + ' · ' + j.thread.reservationStatus +
         (j.thread.reservationCredit > 0 ? ' · Reservation Credit ' + money(j.thread.reservationCredit) : '') +
         (j.thread.tenantOnline ? ' · online' : '');
@@ -9110,7 +8993,7 @@ body.readonly-mode [data-write]{opacity:.5;pointer-events:none;filter:grayscale(
     }
     applyGeometry();
     storeGeometry();
-    if (!min){ const b = el('adm-chat-body'); if (b && window.__admChatPin) window.__admChatPin(b); }
+    if (!min){ const b = el('adm-chat-body'); if (b) b.scrollTop = b.scrollHeight; }
   }
   function initWindowUX(){
     const p = el('adm-chat'); if (!p || p.dataset.uxReady) return;
